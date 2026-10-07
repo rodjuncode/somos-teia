@@ -95,6 +95,18 @@ def make_kinect_body_mask(
     return mask
 
 
+def import_mediapipe_solutions():
+    import mediapipe as mp
+
+    if not hasattr(mp, "solutions"):
+        raise RuntimeError(
+            f"MediaPipe {getattr(mp, '__version__', 'desconhecido')} nao fornece "
+            "mp.solutions; reinstale as dependencias com "
+            "python -m pip install -r requirements.txt"
+        )
+    return mp
+
+
 class KinectCaptureShutdownError(RuntimeError):
     """Raised when a stuck native Kinect call makes fallback unsafe."""
 
@@ -259,7 +271,7 @@ class WebcamCapturer:
     """Webcam USB with segmentation and pose landmarks from MediaPipe."""
 
     def __init__(self, camera_index: int = 0) -> None:
-        import mediapipe as mp
+        mp = import_mediapipe_solutions()
 
         self._capture = cv2.VideoCapture(camera_index)
         if not self._capture.isOpened():
@@ -364,7 +376,7 @@ class VideoCapturer:
     """Video file source that loops at its nominal frame rate."""
 
     def __init__(self, path: str) -> None:
-        import mediapipe as mp
+        mp = import_mediapipe_solutions()
 
         self.path = os.path.abspath(path)
         self._capture = cv2.VideoCapture(self.path)
