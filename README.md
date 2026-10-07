@@ -8,7 +8,7 @@ O protótipo em [`dance_interactive_poc.py`](dance_interactive_poc.py) já imple
 
 - Captura contínua em thread separada, mantendo o frame mais recente disponível para o loop visual.
 - Seleção do Kinect v1 quando o `freenect` e o dispositivo estão acessíveis; caso contrário, tenta webcam com MediaPipe Pose e Selfie Segmentation.
-- Máscara binária por faixa de profundidade no Kinect, configurada inicialmente entre 500 e 950 mm.
+- Máscara binária por faixa de profundidade no Kinect, configurada inicialmente entre 800 e 3000 mm (ajustável por linha de comando e por atalhos).
 - Overlay de máscara/contornos ou landmarks, FPS, faixa de profundidade e latência estimada.
 - Quatro janelas OpenCV: debug, visual de chão, padrão generativo recortado pela máscara do corpo e uma simulação com os dois projetores sobrepostos.
 - Encerramento de captura e janelas ao pressionar `q`.
@@ -52,7 +52,13 @@ Ou sem ativá-lo:
 .venv/bin/python dance_interactive_poc.py
 ```
 
-Pressione `q` em uma janela da aplicação para encerrar. No Kinect, os atalhos alteram a faixa em passos de 25 mm:
+Pressione `q` em uma janela da aplicação para encerrar. A faixa inicial de profundidade vem de `--min-depth` e `--max-depth`, em mm (padrão: 800 a 3000):
+
+```bash
+python dance_interactive_poc.py --min-depth 1000 --max-depth 2500
+```
+
+No Kinect, os atalhos alteram a faixa em passos de 100 mm:
 
 | Tecla | Ação |
 | --- | --- |
@@ -62,6 +68,8 @@ Pressione `q` em uma janela da aplicação para encerrar. No Kinect, os atalhos 
 | `x` | Aumenta o limite máximo |
 
 Esses ajustes só se aplicam ao Kinect. No fallback, a máscara vem da segmentação do MediaPipe; o mapa de profundidade é preenchido com zeros.
+
+**Alcance e fundo:** o Kinect v1 só mede a partir de ~800 mm; abaixo disso a leitura é 0 (inválida) e o corpo não entra na máscara. Quem sai da faixa `Min Depth`–`Max Depth` desaparece das projeções, mas continua visível no vídeo RGB da janela de debug. Como a máscara é só um corte por distância, uma faixa larga também inclui chão, paredes e móveis que estiverem dentro dela; ajuste `Max Depth` para ficar logo atrás da pessoa. Isolar o corpo em qualquer distância exigiria subtração de fundo ou rastreamento de esqueleto (veja o roadmap).
 
 `Ctrl+C` também solicita o encerramento. A captura Kinect usa chamadas síncronas nativas; o programa envia `sync_stop()` e aguarda a thread por tempo limitado para evitar ficar preso se o driver não responder.
 
@@ -93,7 +101,7 @@ Exemplo: `feat(projection): add floor and body composite preview`. Enquanto a ve
 
 1. **Validar hardware e instalação:** testar Kinect 1414/1473, fallback de webcam e encerramento em cada backend.
 2. **Calibrar latência:** documentar timestamp de captura em cada sensor, separar idade do frame de processamento/renderização e medir com ferramenta externa a resposta física do projetor.
-3. **Melhorar interação:** estabilizar o centro de massa, detectar pés/partes do corpo e disparar eventos de onda por movimento.
+3. **Melhorar interação:** isolar o corpo em qualquer distância (subtração de fundo ou esqueleto), estabilizar o centro de massa, detectar pés/partes do corpo e disparar eventos de onda por movimento.
 4. **Preparar projeção:** permitir configuração de resolução, posição das janelas, fullscreen por projetor e calibração geométrica.
 5. **Consolidar operação:** adicionar testes automatizados para funções sem hardware e registrar FPS/latência em execuções longas.
 
