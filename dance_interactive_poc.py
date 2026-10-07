@@ -535,6 +535,7 @@ class VisionProcessor:
         max_distance: float = 150.0,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         point_deadband: float = 4.0,
+        show_points: bool = False,
     ) -> None:
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Modo 2D desconhecido: {mode}")
@@ -545,6 +546,7 @@ class VisionProcessor:
         self.mode = mode
         self.max_distance = max_distance
         self.max_connections = max_connections
+        self.show_points = show_points
         self._presentation_deadband = PresentationDeadband(point_deadband)
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._mog2 = None
@@ -824,8 +826,9 @@ class VisionProcessor:
                 point = tuple(np.rint(position).astype(int))
                 is_head = node_key[1] == 17
                 radius = 7 if is_head else 5
-                cv2.circle(body, point, radius + 3, (0, 55, 0), -1, cv2.LINE_AA)
-                cv2.circle(body, point, radius, (0, 255, 0), -1, cv2.LINE_AA)
+                if self.show_points:
+                    cv2.circle(body, point, radius + 3, (0, 55, 0), -1, cv2.LINE_AA)
+                    cv2.circle(body, point, radius, (0, 255, 0), -1, cv2.LINE_AA)
                 cv2.circle(mask, point, radius + 3, 255, -1, cv2.LINE_AA)
 
         mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)[1]
@@ -929,6 +932,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=4.0,
         help="limiar espacial para ignorar tremor dos nos YOLO, em pixels (padrao: 4)",
     )
+    parser.add_argument(
+        "--show-points",
+        action="store_true",
+        help="mostra circulos das articulacoes e cabeca na malha YOLO",
+    )
     parser.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH_MM, help="profundidade minima em mm (padrao: %(default)s)")
     parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH_MM, help="profundidade maxima em mm (padrao: %(default)s)")
     args = parser.parse_args(argv)
@@ -995,6 +1003,7 @@ def main() -> int:
             max_distance=args.max_distance,
             max_connections=args.max_connections,
             point_deadband=args.point_deadband,
+            show_points=args.show_points,
         )
     except Exception as exc:
         capturer.close()
@@ -1139,6 +1148,7 @@ def main() -> int:
                             max_distance=args.max_distance,
                             max_connections=args.max_connections,
                             point_deadband=args.point_deadband,
+                            show_points=args.show_points,
                         )
                     elif processor is not None:
                         processor.reset()
