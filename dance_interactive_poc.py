@@ -268,7 +268,7 @@ class KinectV1Capturer:
 
 
 class WebcamCapturer:
-    """Webcam USB with MediaPipe segmentation."""
+    """Webcam USB with MediaPipe Pose and no body segmentation."""
 
     def __init__(self, camera_index: int = 0) -> None:
         mp = import_mediapipe_solutions()
@@ -278,14 +278,20 @@ class WebcamCapturer:
             self._capture.release()
             raise RuntimeError("Nao foi possivel abrir a webcam")
 
-        self._segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(
-            model_selection=1
+        self._pose = mp.solutions.pose.Pose(
+            model_complexity=0,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
         )
+        self._mp_drawing = mp.solutions.drawing_utils
+        self._mp_pose = mp.solutions.pose
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._frame: Optional[FrameData] = None
         self._frame_captured_at = 0.0
         self._last_read_timestamp = 0.0
+        self._pose_landmarks = None
         self.error: Optional[Exception] = None
         self._thread = threading.Thread(
             target=self._capture_loop, name="webcam-capture", daemon=False
@@ -300,12 +306,13 @@ class WebcamCapturer:
                     raise RuntimeError("Falha ao ler frame da webcam")
                 captured_at = time.perf_counter()
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                segmentation = self._segmenter.process(rgb)
-                mask = (segmentation.segmentation_mask > 0.4).astype(np.uint8) * 255
+                pose = self._pose.process(rgb)
+                mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
                 depth = np.zeros(mask.shape, dtype=np.uint16)
                 with self._lock:
                     self._frame = (rgb, depth, mask)
                     self._frame_captured_at = captured_at
+                    self._pose_landmarks = pose.pose_landmarks
         except Exception as exc:
             self.error = exc
             self._stop_event.set()
@@ -321,7 +328,7 @@ class WebcamCapturer:
 
     @property
     def source_label(self) -> str:
-        return "WEBCAM USB (MediaPipe Seg)"
+        return "WEBCAM USB (MediaPipe Pose; sem mascara)"
 
     @property
     def source_key(self) -> str:
@@ -348,19 +355,20 @@ class WebcamCapturer:
 
     @property
     def pose_landmarks(self):
-        return None
+        with self._lock:
+            return self._pose_landmarks
 
     def close(self) -> None:
         self._stop_event.set()
         self._thread.join(timeout=3.0)
         self._capture.release()
-        self._segmenter.close()
+        self._pose.close()
         if self._thread.is_alive():
             raise RuntimeError("A thread da webcam nao encerrou em 3 segundos")
 
 
 class VideoCapturer:
-    """Video file source with MediaPipe segmentation that loops at its frame rate."""
+    """Video file source with MediaPipe Pose and no body mask, looping at its frame rate."""
 
     def __init__(self, path: str) -> None:
         mp = import_mediapipe_solutions()
@@ -373,14 +381,20 @@ class VideoCapturer:
 
         fps = self._capture.get(cv2.CAP_PROP_FPS)
         self._frame_period = 1.0 / (fps if 1.0 <= fps <= 120.0 else 30.0)
-        self._segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(
-            model_selection=1
+        self._pose = mp.solutions.pose.Pose(
+            model_complexity=0,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
         )
+        self._mp_drawing = mp.solutions.drawing_utils
+        self._mp_pose = mp.solutions.pose
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._frame: Optional[FrameData] = None
         self._frame_captured_at = 0.0
         self._last_read_timestamp = 0.0
+        self._pose_landmarks = None
         self.error: Optional[Exception] = None
         self._thread = threading.Thread(
             target=self._capture_loop, name="video-capture", daemon=False
@@ -400,12 +414,13 @@ class VideoCapturer:
 
                 captured_at = time.perf_counter()
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                segmentation = self._segmenter.process(rgb)
-                mask = (segmentation.segmentation_mask > 0.4).astype(np.uint8) * 255
+                pose = self._pose.process(rgb)
+                mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
                 depth = np.zeros(mask.shape, dtype=np.uint16)
                 with self._lock:
                     self._frame = (rgb, depth, mask)
                     self._frame_captured_at = captured_at
+                    self._pose_landmarks = pose.pose_landmarks
 
                 next_frame_at += self._frame_period
                 if next_frame_at < time.perf_counter():
@@ -424,7 +439,7 @@ class VideoCapturer:
 
     @property
     def source_label(self) -> str:
-        return f"VIDEO [{os.path.basename(self.path)}] (MediaPipe Seg)"
+        return f"VIDEO [{os.path.basename(self.path)}] (MediaPipe Pose; sem mascara)"
 
     @property
     def source_key(self) -> str:
@@ -437,7 +452,8 @@ class VideoCapturer:
 
     @property
     def pose_landmarks(self):
-        return None
+        with self._lock:
+            return self._pose_landmarks
 
     @property
     def depth_range(self) -> tuple[int, int]:
@@ -457,7 +473,7 @@ class VideoCapturer:
         self._stop_event.set()
         self._thread.join(timeout=3.0)
         self._capture.release()
-        self._segmenter.close()
+        self._pose.close()
         if self._thread.is_alive():
             raise RuntimeError("A thread de video nao encerrou em 3 segundos")
 
@@ -550,7 +566,13 @@ def draw_debug_overlay(
         f"Latencia: {latency_ms:.1f} ms",
         f"Min Depth: {min_depth} mm" if max_depth else "Min Depth: N/A",
         f"Max Depth: {max_depth} mm" if max_depth else "Max Depth: N/A",
-        "Fundo: calibrado" if background_active else "Fundo: pressione B vazio",
+        (
+            "Mascara: desativada"
+            if not max_depth
+            else "Fundo: calibrado"
+            if background_active
+            else "Fundo: pressione B vazio"
+        ),
         f"Fonte Ativa: {source}",
     ]
     cv2.rectangle(debug, (8, 8), (620, 150), (0, 0, 0), -1)
