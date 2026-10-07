@@ -69,7 +69,9 @@ No Kinect, os atalhos alteram a faixa em passos de 100 mm:
 
 Esses ajustes só se aplicam ao Kinect. No fallback, a máscara vem da segmentação do MediaPipe; o mapa de profundidade é preenchido com zeros.
 
-**Alcance e fundo:** o Kinect v1 só mede a partir de ~800 mm; abaixo disso a leitura é 0 (inválida) e o corpo não entra na máscara. Quem sai da faixa `Min Depth`–`Max Depth` desaparece das projeções, mas continua visível no vídeo RGB da janela de debug. Como a máscara é só um corte por distância, uma faixa larga também inclui chão, paredes e móveis que estiverem dentro dela; ajuste `Max Depth` para ficar logo atrás da pessoa. Isolar o corpo em qualquer distância exigiria subtração de fundo ou rastreamento de esqueleto (veja o roadmap).
+**Alcance, fundo e sombra:** no mapa de profundidade, o valor 0 significa "sem leitura" e nunca entra na máscara. Medido nesta unidade (Kinect for Windows), há leituras válidas desde ~410 mm, então o limite mínimo padrão de 800 mm é uma escolha, não um limite do sensor. Quem sai da faixa `Min Depth`–`Max Depth` desaparece das projeções, mas continua visível no vídeo RGB da janela de debug.
+
+Como a máscara é só um corte por distância, **tudo** dentro da faixa entra: se a parede do fundo estiver a 2 m e `Max Depth` for 3000 mm, o fundo inteiro é texturizado e o dançarino não se destaca. Ajuste `Max Depth` para ficar logo atrás da pessoa (ou `Min Depth` logo antes), ou passe `--max-depth`. A "sombra" junto ao corpo é a sombra do projetor infravermelho do Kinect: pixels da borda do corpo, no lado oposto ao emissor, ficam sem leitura (0) e portanto fora da máscara. Isolar o corpo em qualquer distância, sem acertar a faixa, exigiria subtração de fundo ou rastreamento de esqueleto (veja o roadmap).
 
 `Ctrl+C` também solicita o encerramento. A captura Kinect usa chamadas síncronas nativas; o programa envia `sync_stop()` e aguarda a thread por tempo limitado para evitar ficar preso se o driver não responder.
 
