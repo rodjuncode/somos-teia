@@ -31,10 +31,10 @@ sudo apt-get install libfreenect-dev libfreenect-bin python3-dev python3-venv bu
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install cython freenect opencv-python numpy mediapipe
+python -m pip install -r requirements-kinect.txt
 ```
 
-O comando pip instala tudo dentro do venv. Os mesmos pacotes estão listados em [`requirements-kinect.txt`](requirements-kinect.txt); para usar somente webcam ou vídeo, sem Kinect, basta `python -m pip install -r requirements.txt`.
+O comando pip instala tudo dentro do venv. As versões de NumPy, OpenCV e MediaPipe estão alinhadas: a PoC usa a API `mp.solutions` de MediaPipe 0.10.21; a série 1.x remove essa API legada. Os mesmos pacotes estão listados em [`requirements-kinect.txt`](requirements-kinect.txt); para usar somente webcam ou vídeo, sem Kinect, basta `python -m pip install -r requirements.txt`.
 
 Para conferir a binding antes de conectar a câmera, execute `python -c "import freenect; print('freenect importado')"` dentro do venv. A disponibilidade do dispositivo e as permissões USB ainda precisam ser verificadas no hardware usado.
 
