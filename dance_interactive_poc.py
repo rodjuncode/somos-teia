@@ -466,7 +466,6 @@ class VisionResult:
     body_mask: np.ndarray
     debug_frame: np.ndarray
     body_frame: np.ndarray
-    center: Optional[tuple[int, int]] = None
 
 
 class VisionProcessor:
@@ -527,25 +526,6 @@ class VisionProcessor:
         return mask
 
     @staticmethod
-    def _center(mask: np.ndarray) -> Optional[tuple[int, int]]:
-        moments = cv2.moments(mask, binaryImage=True)
-        if moments["m00"] == 0:
-            return None
-        return (
-            int(moments["m10"] / moments["m00"]),
-            int(moments["m01"] / moments["m00"]),
-        )
-
-    @classmethod
-    def _scaled_center(
-        cls, mask: np.ndarray, scale: float
-    ) -> Optional[tuple[int, int]]:
-        center = cls._center(mask)
-        if center is None:
-            return None
-        return int(center[0] / scale), int(center[1] / scale)
-
-    @staticmethod
     def _empty_result(frame_bgr: np.ndarray) -> VisionResult:
         height, width = frame_bgr.shape[:2]
         mask = np.zeros((height, width), dtype=np.uint8)
@@ -568,12 +548,7 @@ class VisionProcessor:
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
             cv2.drawContours(debug, contours, -1, (0, 255, 0), 1)
-            return VisionResult(
-                mask,
-                debug,
-                make_body_visual(mask, 0.0),
-                self._scaled_center(small_mask, self.MOG2_SCALE),
-            )
+            return VisionResult(mask, debug, make_body_visual(mask))
 
         gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
         if self.mode == "optical_flow":
@@ -622,9 +597,7 @@ class VisionProcessor:
                 if small_mask[y, x]:
                     cv2.arrowedLine(body, start, end, (0, 255, 255), 1, cv2.LINE_AA)
             body = cv2.bitwise_and(body, body, mask=mask)
-        return VisionResult(
-            mask, debug, body, self._scaled_center(small_mask, self.FLOW_SCALE)
-        )
+        return VisionResult(mask, debug, body)
 
     @staticmethod
     def _to_numpy(value) -> Optional[np.ndarray]:
@@ -646,12 +619,12 @@ class VisionProcessor:
         points_by_person = self._to_numpy(getattr(keypoints, "xy", None))
         confidence = self._to_numpy(getattr(keypoints, "conf", None))
         boxes = self._to_numpy(getattr(getattr(result, "boxes", None), "xyxy", None))
+        body = np.zeros_like(frame_bgr)
 
         if boxes is not None:
             for box in boxes:
                 x1, y1, x2, y2 = np.rint(box[:4]).astype(int)
                 cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 200, 255), 2)
-
         if points_by_person is not None:
             for person_index, points in enumerate(points_by_person):
                 valid = (
@@ -672,12 +645,14 @@ class VisionProcessor:
                         p2 = tuple(integer_points[end])
                         cv2.line(mask, p1, p2, 255, 24, cv2.LINE_AA)
                         cv2.line(debug, p1, p2, (0, 0, 255), 1, cv2.LINE_AA)
+                        cv2.line(body, p1, p2, (0, 0, 255), 1, cv2.LINE_AA)
                 for point_index in range(5, len(integer_points)):
                     point = integer_points[point_index]
                     if valid[point_index]:
                         p = tuple(point)
                         cv2.circle(mask, p, 12, 255, -1, cv2.LINE_AA)
                         cv2.circle(debug, p, 4, (0, 255, 0), -1, cv2.LINE_AA)
+                        cv2.circle(body, p, 4, (0, 255, 0), -1, cv2.LINE_AA)
 
                 visible_head = integer_points[:5][valid[:5]]
                 if len(visible_head):
@@ -690,10 +665,12 @@ class VisionProcessor:
                             + 5
                         ),
                     )
+                    cv2.circle(mask, head_center, radius, 255, 1, cv2.LINE_AA)
                     cv2.circle(debug, head_center, radius, (0, 0, 255), 1, cv2.LINE_AA)
+                    cv2.circle(body, head_center, radius, (0, 0, 255), 1, cv2.LINE_AA)
 
         mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)[1]
-        return VisionResult(mask, debug, make_body_visual(mask, 0.0), self._center(mask))
+        return VisionResult(mask, debug, cv2.bitwise_and(body, body, mask=mask))
 
 
 def latency_color(latency_ms: float) -> tuple[int, int, int]:
@@ -704,42 +681,9 @@ def latency_color(latency_ms: float) -> tuple[int, int, int]:
     return (0, 0, 255)
 
 
-def make_floor_visual(
-    mask: np.ndarray,
-    elapsed: float,
-    phase: float,
-    center: Optional[tuple[int, int]] = None,
-) -> np.ndarray:
-    height, width = mask.shape
-    floor = np.zeros((height, width, 3), dtype=np.uint8)
-    if center is None:
-        moments = cv2.moments(mask, binaryImage=True)
-        if moments["m00"] > 0:
-            center = (
-                int(moments["m10"] / moments["m00"]),
-                int(moments["m01"] / moments["m00"]),
-            )
-    if center is not None:
-        radius = int(30 + (elapsed % 1.5) / 1.5 * max(height, width) * 0.55)
-        for ring in range(3):
-            current_radius = max(1, radius - ring * 42)
-            cv2.circle(floor, center, current_radius, (255, 150, 35), 2, cv2.LINE_AA)
-        cv2.circle(floor, center, 8, (255, 240, 190), -1, cv2.LINE_AA)
-
-    # Ondas horizontais sutis mantem o piso vivo mesmo quando o corpo esta parado.
-    y = int((phase * 45) % max(height, 1))
-    cv2.line(floor, (0, y), (width - 1, y), (24, 48, 52), 1, cv2.LINE_AA)
-    return floor
-
-
-def make_body_visual(mask: np.ndarray, elapsed: float) -> np.ndarray:
+def make_body_visual(mask: np.ndarray) -> np.ndarray:
     zeros = np.zeros_like(mask)
     return cv2.merge((zeros, zeros, mask))
-
-
-def make_composite_preview(floor: np.ndarray, body: np.ndarray) -> np.ndarray:
-    # Soma saturada: dois projetores sobrepostos somam luz, nao se substituem.
-    return cv2.add(floor, body)
 
 
 def draw_debug_overlay(
@@ -852,24 +796,16 @@ def main() -> int:
             source_choices.append(video_choice)
     windows = (
         "Debug & Tracking",
-        "Projetor 1 - Chao/Fundo",
         "Projetor 2 - Corpo/Frontal",
-        "Simulacao - Chao + Corpo",
     )
     cv2.namedWindow(windows[0], cv2.WINDOW_NORMAL)
     cv2.namedWindow(windows[1], cv2.WINDOW_NORMAL)
-    cv2.namedWindow(windows[2], cv2.WINDOW_NORMAL)
-    cv2.namedWindow(windows[3], cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(windows[1], cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    cv2.setWindowProperty(windows[2], cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    recent_latency = deque(maxlen=30)
     recent_frame_times = deque(maxlen=30)
     last_latency_ms = 0.0
-    phase = 0.0
-    start_time = time.perf_counter()
     last_processed_timestamp: Optional[float] = None
-    cached_images: Optional[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None
+    cached_images: Optional[tuple[np.ndarray, np.ndarray]] = None
     try:
         while True:
             if capturer.error is not None:
@@ -884,7 +820,6 @@ def main() -> int:
             frame_start = capturer.last_read_timestamp
             is_new_frame = frame_start != last_processed_timestamp
             if is_new_frame:
-                elapsed = frame_start - start_time
                 recent_frame_times.append(frame_start)
                 if active_mode == "kinect":
                     debug = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
@@ -923,15 +858,12 @@ def main() -> int:
                     depth_range,
                     capturer.background_active if active_mode == "kinect" else False,
                 )
-                center = vision_result.center if vision_result is not None else None
-                floor = make_floor_visual(body_mask, elapsed, phase, center)
                 body = (
                     vision_result.body_frame
                     if vision_result is not None
-                    else make_body_visual(body_mask, elapsed)
+                    else make_body_visual(body_mask)
                 )
-                composite = make_composite_preview(floor, body)
-                cached_images = (debug, floor, body, composite)
+                cached_images = (debug, body)
                 last_processed_timestamp = frame_start
 
             if cached_images is None:
@@ -942,8 +874,6 @@ def main() -> int:
             key = cv2.waitKey(1) & 0xFF
             if is_new_frame:
                 last_latency_ms = (time.perf_counter() - frame_start) * 1000.0
-                recent_latency.append(last_latency_ms)
-            phase += 1.0 / max(fps, 1.0)
             if key == ord("q"):
                 break
             if key == ord("m"):
@@ -996,7 +926,6 @@ def main() -> int:
                         processor.reset()
                     recent_frame_times.clear()
                     last_latency_ms = 0.0
-                    start_time = time.perf_counter()
                     last_processed_timestamp = None
                     cached_images = None
                 continue

@@ -14,7 +14,7 @@ O protótipo em [`dance_interactive_poc.py`](dance_interactive_poc.py) já imple
 - Modo Kinect mantém profundidade RAW; se a inicialização falhar, o fallback usa MOG2 na webcam/vídeo.
 - Máscara binária por faixa de profundidade no Kinect, configurada inicialmente entre 800 e 3000 mm (ajustável por linha de comando e por atalhos).
 - Overlay de máscara/contornos, vetores ópticos ou esqueleto YOLO, FPS, modo ativo e latência estimada.
-- Quatro janelas OpenCV: debug, visual de chão, silhueta vermelha recortada e uma simulação com os projetores sobrepostos.
+- Duas janelas OpenCV neste momento: debug e projetor Corpo/Frontal. As telas de Chão/Fundo e Simulação/Consolidada e todo o cálculo associado estão temporariamente removidos.
 - Encerramento de captura e janelas ao pressionar `q`.
 
 O código compila e MOG2, Farneback e YOLO foram verificados com quadros sintéticos; YOLO real/model weights e execução ponta a ponta nos projetores ainda não foram validados nesta revisão. As metas de latência são objetivos por algoritmo, não garantias ponta a ponta.
@@ -102,9 +102,9 @@ Todos os capturadores entregam ao loop principal `(success, frame_rgb, depth_or_
 ## Janelas e telemetria
 
 - **Debug & Tracking:** vídeo da fonte com máscara, vetores ou caixa/esqueleto conforme o algoritmo, FPS, latência, modo e fonte ativos.
-- **Projetor 1 - Chão/Fundo:** ondas e círculos guiados pelo centro de massa da máscara.
-- **Projetor 2 - Corpo/Frontal:** padrão vermelho sólido recortado pela máscara produzida pelo algoritmo ativo.
-- **Simulação - Chão + Corpo:** pré-visualização de como os dois projetores ficam sobrepostos. As imagens são somadas (com saturação em 255), como a luz de dois projetores; fora da silhueta aparece só o chão. É uma janela comum, não em tela cheia, e não depende de um segundo monitor.
+- **Projetor Corpo/Frontal:** MOG2/Kinect projetam a máscara vermelha; Optical Flow projeta vetores; YOLO projeta o mesmo esqueleto do Debug (ossos vermelhos finos, nós verdes e cabeça em anel vermelho).
+
+As janelas Chão/Fundo e Simulação/Consolidada estão temporariamente desativadas; o loop não calcula centroide, ondas nem composição dessas telas.
 
 A latência exibida é medida por `time.perf_counter()` desde o timestamp associado ao frame até o fim do ciclo de exibição/`waitKey`. É uma estimativa de software; não mede exposição do sensor, sincronização real dos projetores ou o tempo até o conteúdo aparecer fisicamente. Os timestamps de Kinect e webcam também não são equivalentes, portanto os resultados entre modos não devem ser comparados como uma medição calibrada.
 
