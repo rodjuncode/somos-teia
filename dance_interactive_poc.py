@@ -972,6 +972,7 @@ def make_vision_processor(
     max_distance: float = 150.0,
     max_connections: int = DEFAULT_MAX_CONNECTIONS,
     point_deadband: float = 4.0,
+    show_points: bool = False,
 ) -> Optional[VisionProcessor]:
     return (
         None
@@ -982,6 +983,7 @@ def make_vision_processor(
             max_distance=max_distance,
             max_connections=max_connections,
             point_deadband=point_deadband,
+            show_points=show_points,
         )
     )
 
