@@ -265,6 +265,7 @@ class WebcamCapturer:
         if not self._capture.isOpened():
             self._capture.release()
             raise RuntimeError("Nao foi possivel abrir a webcam")
+        self._capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -619,8 +620,8 @@ class VisionProcessor:
             cv2.drawContours(debug, contours, -1, (0, 255, 0), 1)
             return VisionResult(mask, debug, make_body_visual(mask))
 
-        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
         if self.mode == "optical_flow":
+            gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
             small_gray = cv2.resize(
                 gray,
                 (
@@ -688,15 +689,16 @@ class VisionProcessor:
             empty = np.empty(0, dtype=np.intp)
             return empty, empty, np.empty(0, dtype=np.float32)
 
-        offsets = coordinates[:, None, :] - coordinates[None, :, :]
-        distances = np.sqrt(np.sum(offsets * offsets, axis=2))
         first, second = np.triu_indices(len(coordinates), k=1)
-        candidates = distances[first, second] < max_distance
+        deltas = coordinates[first] - coordinates[second]
+        squared_distances = np.einsum("ij,ij->i", deltas, deltas)
+        candidates = squared_distances < max_distance * max_distance
         first, second = first[candidates], second[candidates]
-        edge_distances = distances[first, second]
-        order = np.argsort(edge_distances, kind="stable")
+        squared_distances = squared_distances[candidates]
+        order = np.argsort(squared_distances, kind="stable")
         degrees = np.zeros(len(coordinates), dtype=np.int32)
         selected = []
+        saturated_nodes = 0
 
         for edge_index in order:
             node_a, node_b = int(first[edge_index]), int(second[edge_index])
@@ -704,10 +706,18 @@ class VisionProcessor:
                 continue
             degrees[node_a] += 1
             degrees[node_b] += 1
+            saturated_nodes += int(degrees[node_a] == max_connections)
+            saturated_nodes += int(degrees[node_b] == max_connections)
             selected.append(edge_index)
+            if saturated_nodes == len(degrees):
+                break
 
         selected = np.asarray(selected, dtype=np.intp)
-        return first[selected], second[selected], edge_distances[selected]
+        return (
+            first[selected],
+            second[selected],
+            np.sqrt(squared_distances[selected]),
+        )
 
     def _process_yolo(self, frame_bgr: np.ndarray) -> VisionResult:
         height, width = frame_bgr.shape[:2]
@@ -716,7 +726,7 @@ class VisionProcessor:
         if self._yolo_device is not None:
             inference_options["device"] = self._yolo_device
         predictions = self._yolo(
-            frame_320, imgsz=320, verbose=False, **inference_options
+            frame_320, imgsz=320, max_det=16, verbose=False, **inference_options
         )
         result = predictions[0]
         scale_x, scale_y = width / 320.0, height / 240.0
@@ -724,9 +734,10 @@ class VisionProcessor:
         points_by_person = self._to_numpy(getattr(keypoints, "xy", None))
         confidence = self._to_numpy(getattr(keypoints, "conf", None))
         raw_nodes: dict[tuple[int, int], tuple[float, float]] = {}
+        point_scale = np.array((scale_x, scale_y), dtype=np.float32)
         if points_by_person is not None:
             for person_index, points in enumerate(points_by_person):
-                points = points * np.array((scale_x, scale_y), dtype=np.float32)
+                points = points * point_scale
                 valid = (
                     np.isfinite(points).all(axis=1)
                     & (points[:, 0] >= 0)
@@ -770,21 +781,20 @@ class VisionProcessor:
                 thickness = 1 + int(line_alpha * 2)
                 point_a = tuple(np.rint(coordinates[node_a]).astype(int))
                 point_b = tuple(np.rint(coordinates[node_b]).astype(int))
-                cv2.line(debug, point_a, point_b, line_color, thickness, cv2.LINE_AA)
                 cv2.line(body, point_a, point_b, line_color, thickness, cv2.LINE_AA)
-                cv2.line(mask, point_a, point_b, 255, 2, cv2.LINE_AA)
+                cv2.line(mask, point_a, point_b, 255, thickness, cv2.LINE_AA)
 
             for node_key, position in nodes:
                 point = tuple(np.rint(position).astype(int))
                 is_head = node_key[1] == 17
                 radius = 7 if is_head else 5
-                cv2.circle(debug, point, radius + 3, (0, 55, 0), -1, cv2.LINE_AA)
                 cv2.circle(body, point, radius + 3, (0, 55, 0), -1, cv2.LINE_AA)
-                cv2.circle(debug, point, radius, (0, 255, 0), -1, cv2.LINE_AA)
                 cv2.circle(body, point, radius, (0, 255, 0), -1, cv2.LINE_AA)
                 cv2.circle(mask, point, radius + 3, 255, -1, cv2.LINE_AA)
 
         mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)[1]
+        if nodes:
+            debug = cv2.addWeighted(debug, 1.0, body, 0.85, 0.0)
         return VisionResult(mask, debug, body)
 
 
