@@ -29,7 +29,7 @@ import numpy as np
 
 # Medido: o 1o frame do Kinect v1 chega em ~7 s neste equipamento.
 KINECT_START_TIMEOUT = 20.0
-# O Kinect v1 so mede a partir de ~800 mm; 0 significa "sem leitura".
+# 0 significa "sem leitura" no mapa de profundidade do Kinect v1.
 DEFAULT_MIN_DEPTH_MM = 800
 DEFAULT_MAX_DEPTH_MM = 3000
 DEPTH_STEP_MM = 100
@@ -95,7 +95,8 @@ class KinectV1Capturer:
                     raise RuntimeError("O Kinect nao forneceu frame RGB")
                 depth, _ = depth_packet
                 rgb, _ = video_packet
-                depth = np.asarray(depth)
+                # O array do driver e liberado em sync_stop(); copiar evita acesso a memoria invalida.
+                depth = np.array(depth, copy=True)
                 rgb = cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
 
                 with self._lock:
