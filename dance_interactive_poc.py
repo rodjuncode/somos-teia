@@ -268,7 +268,7 @@ class KinectV1Capturer:
 
 
 class WebcamCapturer:
-    """Webcam USB with segmentation and pose landmarks from MediaPipe."""
+    """Webcam USB with MediaPipe segmentation."""
 
     def __init__(self, camera_index: int = 0) -> None:
         mp = import_mediapipe_solutions()
@@ -281,20 +281,11 @@ class WebcamCapturer:
         self._segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(
             model_selection=1
         )
-        self._pose = mp.solutions.pose.Pose(
-            model_complexity=0,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        self._mp_drawing = mp.solutions.drawing_utils
-        self._mp_pose = mp.solutions.pose
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._frame: Optional[FrameData] = None
         self._frame_captured_at = 0.0
         self._last_read_timestamp = 0.0
-        self._pose_landmarks = None
         self.error: Optional[Exception] = None
         self._thread = threading.Thread(
             target=self._capture_loop, name="webcam-capture", daemon=False
@@ -310,13 +301,11 @@ class WebcamCapturer:
                 captured_at = time.perf_counter()
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 segmentation = self._segmenter.process(rgb)
-                pose = self._pose.process(rgb)
                 mask = (segmentation.segmentation_mask > 0.4).astype(np.uint8) * 255
                 depth = np.zeros(mask.shape, dtype=np.uint16)
                 with self._lock:
                     self._frame = (rgb, depth, mask)
                     self._frame_captured_at = captured_at
-                    self._pose_landmarks = pose.pose_landmarks
         except Exception as exc:
             self.error = exc
             self._stop_event.set()
@@ -359,21 +348,19 @@ class WebcamCapturer:
 
     @property
     def pose_landmarks(self):
-        with self._lock:
-            return self._pose_landmarks
+        return None
 
     def close(self) -> None:
         self._stop_event.set()
         self._thread.join(timeout=3.0)
         self._capture.release()
         self._segmenter.close()
-        self._pose.close()
         if self._thread.is_alive():
             raise RuntimeError("A thread da webcam nao encerrou em 3 segundos")
 
 
 class VideoCapturer:
-    """Video file source that loops at its nominal frame rate."""
+    """Video file source with MediaPipe segmentation that loops at its frame rate."""
 
     def __init__(self, path: str) -> None:
         mp = import_mediapipe_solutions()
@@ -389,20 +376,11 @@ class VideoCapturer:
         self._segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(
             model_selection=1
         )
-        self._pose = mp.solutions.pose.Pose(
-            model_complexity=0,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        self._mp_drawing = mp.solutions.drawing_utils
-        self._mp_pose = mp.solutions.pose
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._frame: Optional[FrameData] = None
         self._frame_captured_at = 0.0
         self._last_read_timestamp = 0.0
-        self._pose_landmarks = None
         self.error: Optional[Exception] = None
         self._thread = threading.Thread(
             target=self._capture_loop, name="video-capture", daemon=False
@@ -423,13 +401,11 @@ class VideoCapturer:
                 captured_at = time.perf_counter()
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 segmentation = self._segmenter.process(rgb)
-                pose = self._pose.process(rgb)
                 mask = (segmentation.segmentation_mask > 0.4).astype(np.uint8) * 255
                 depth = np.zeros(mask.shape, dtype=np.uint16)
                 with self._lock:
                     self._frame = (rgb, depth, mask)
                     self._frame_captured_at = captured_at
-                    self._pose_landmarks = pose.pose_landmarks
 
                 next_frame_at += self._frame_period
                 if next_frame_at < time.perf_counter():
@@ -461,8 +437,7 @@ class VideoCapturer:
 
     @property
     def pose_landmarks(self):
-        with self._lock:
-            return self._pose_landmarks
+        return None
 
     @property
     def depth_range(self) -> tuple[int, int]:
@@ -483,7 +458,6 @@ class VideoCapturer:
         self._thread.join(timeout=3.0)
         self._capture.release()
         self._segmenter.close()
-        self._pose.close()
         if self._thread.is_alive():
             raise RuntimeError("A thread de video nao encerrou em 3 segundos")
 
@@ -552,16 +526,8 @@ def make_floor_visual(mask: np.ndarray, elapsed: float, phase: float) -> np.ndar
 
 
 def make_body_visual(mask: np.ndarray, elapsed: float) -> np.ndarray:
-    height, width = mask.shape
-    y, x = np.indices((height, width), dtype=np.float32)
-    wave = (np.sin(x * 0.055 + elapsed * 3.0) + np.cos(y * 0.065 - elapsed * 2.0))
-    glow = np.clip((wave + 2.0) * 58, 0, 255).astype(np.uint8)
-    pattern = np.zeros((height, width, 3), dtype=np.uint8)
-    pattern[:, :, 0] = glow
-    pattern[:, :, 1] = np.clip(glow * 0.7 + 28, 0, 255).astype(np.uint8)
-    pattern[:, :, 2] = np.clip(245 - glow * 0.45, 0, 255).astype(np.uint8)
-    # bitwise_and garante preto absoluto fora da mascara binaria.
-    return cv2.bitwise_and(pattern, pattern, mask=mask)
+    zeros = np.zeros_like(mask)
+    return cv2.merge((zeros, zeros, mask))
 
 
 def make_composite_preview(floor: np.ndarray, body: np.ndarray) -> np.ndarray:
