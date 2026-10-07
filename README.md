@@ -10,7 +10,7 @@ O protótipo em [`dance_interactive_poc.py`](dance_interactive_poc.py) já imple
 - Seleção do Kinect v1 quando o `freenect` e o dispositivo estão acessíveis; caso contrário, tenta webcam com MediaPipe Pose e Selfie Segmentation.
 - Máscara binária por faixa de profundidade no Kinect, configurada inicialmente entre 500 e 950 mm.
 - Overlay de máscara/contornos ou landmarks, FPS, faixa de profundidade e latência estimada.
-- Três janelas OpenCV: debug, visual de chão e padrão generativo recortado pela máscara do corpo.
+- Quatro janelas OpenCV: debug, visual de chão, padrão generativo recortado pela máscara do corpo e uma simulação com os dois projetores sobrepostos.
 - Encerramento de captura e janelas ao pressionar `q`.
 
 O script passou por compilação sintática no ambiente virtual. Ainda não houve validação com Kinect, webcam, projetores ou medição física de latência. O alvo de menos de 35 ms é um objetivo de desenvolvimento, não uma garantia da PoC.
@@ -70,10 +70,24 @@ Esses ajustes só se aplicam ao Kinect. No fallback, a máscara vem da segmenta�
 - **Debug & Tracking:** vídeo com máscara/landmarks e FPS, latência e limites do sensor.
 - **Projetor 1 - Chão/Fundo:** ondas e círculos guiados pelo centro de massa da máscara.
 - **Projetor 2 - Corpo/Frontal:** padrão generativo aplicado apenas dentro da máscara binária.
+- **Simulação - Chão + Corpo:** pré-visualização de como os dois projetores ficam sobrepostos. As imagens são somadas (com saturação em 255), como a luz de dois projetores; fora da silhueta aparece só o chão. É uma janela comum, não em tela cheia, e não depende de um segundo monitor.
 
 A latência exibida é medida por `time.perf_counter()` desde o timestamp associado ao frame até o fim do ciclo de exibição/`waitKey`. É uma estimativa de software; não mede exposição do sensor, sincronização real dos projetores ou o tempo até o conteúdo aparecer fisicamente. Os timestamps de Kinect e webcam também não são equivalentes, portanto os resultados entre modos não devem ser comparados como uma medição calibrada.
 
 O indicador usa verde até 35 ms, amarelo acima de 35 até 45 ms e vermelho acima de 45 ms. O FPS representa a taxa observada pelo loop visual, não necessariamente a taxa nativa do sensor.
+
+## Versionamento e commits
+
+O projeto segue [Versionamento Semântico](https://semver.org/lang/pt-BR/) e [Conventional Commits](https://www.conventionalcommits.org/pt-br/). A branch principal é `main` e cada versão publicada recebe uma tag anotada `vX.Y.Z`.
+
+| Tipo de commit | Efeito na versão |
+| --- | --- |
+| `feat:` | minor (`0.X.0`) |
+| `fix:`, `perf:` | patch (`0.0.X`) |
+| `feat!:` ou rodapé `BREAKING CHANGE:` | major (`X.0.0`); antes da `1.0.0`, incrementa o minor |
+| `docs:`, `chore:`, `refactor:`, `test:`, `build:`, `ci:` | sem mudança de versão |
+
+Exemplo: `feat(projection): add floor and body composite preview`. Enquanto a versão for `0.y.z`, a API ainda é instável.
 
 ## Roadmap
 
