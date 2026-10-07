@@ -10,9 +10,10 @@ O protótipo em [`dance_interactive_poc.py`](dance_interactive_poc.py) já imple
 - Três fontes intercambiáveis pela CLI e pela tecla `m`: Kinect v1, webcam USB e arquivo MP4/MOV em loop.
 - Fallback automático de Kinect para webcam e, opcionalmente, arquivo de vídeo.
 - Saída padronizada de todos os capturadores: sucesso, frame RGB, profundidade real ou matriz dummy e máscara corporal.
+- Webcam e vídeo usam MediaPipe Selfie Segmentation; o cálculo de Pose está temporariamente desativado para reduzir latência.
 - Máscara binária por faixa de profundidade no Kinect, configurada inicialmente entre 800 e 3000 mm (ajustável por linha de comando e por atalhos).
 - Overlay de máscara/contornos ou landmarks, FPS, faixa de profundidade e latência estimada.
-- Quatro janelas OpenCV: debug, visual de chão, padrão generativo recortado pela máscara do corpo e uma simulação com os dois projetores sobrepostos.
+- Quatro janelas OpenCV: debug, visual de chão, silhueta vermelha recortada e uma simulação com os projetores sobrepostos.
 - Encerramento de captura e janelas ao pressionar `q`.
 
 O script passou por compilação sintática no ambiente virtual. Ainda não houve validação com Kinect, webcam, projetores ou medição física de latência. O alvo de menos de 35 ms é um objetivo de desenvolvimento, não uma garantia da PoC.
@@ -81,9 +82,9 @@ Todos os capturadores entregam ao loop principal `(success, frame_rgb, depth_or_
 
 ## Janelas e telemetria
 
-- **Debug & Tracking:** vídeo com máscara/landmarks, FPS, latência, limites do sensor e fonte ativa.
+- **Debug & Tracking:** vídeo com máscara/contorno, FPS, latência, limites do sensor e fonte ativa. Pose está desativado nos modos webcam e vídeo.
 - **Projetor 1 - Chão/Fundo:** ondas e círculos guiados pelo centro de massa da máscara.
-- **Projetor 2 - Corpo/Frontal:** padrão generativo aplicado apenas dentro da máscara binária.
+- **Projetor 2 - Corpo/Frontal:** vermelho sólido aplicado apenas dentro da máscara binária.
 - **Simulação - Chão + Corpo:** pré-visualização de como os dois projetores ficam sobrepostos. As imagens são somadas (com saturação em 255), como a luz de dois projetores; fora da silhueta aparece só o chão. É uma janela comum, não em tela cheia, e não depende de um segundo monitor.
 
 A latência exibida é medida por `time.perf_counter()` desde o timestamp associado ao frame até o fim do ciclo de exibição/`waitKey`. É uma estimativa de software; não mede exposição do sensor, sincronização real dos projetores ou o tempo até o conteúdo aparecer fisicamente. Os timestamps de Kinect e webcam também não são equivalentes, portanto os resultados entre modos não devem ser comparados como uma medição calibrada.
