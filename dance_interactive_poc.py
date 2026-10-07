@@ -43,6 +43,7 @@ BACKGROUND_SAMPLE_COUNT = 15
 BACKGROUND_DIFF_MM = 80
 YOLO_PT_MODEL = "yolov8n-pose.pt"
 YOLO_OPENVINO_MODEL = "yolov8n-pose_openvino_model"
+DEFAULT_MAX_CONNECTIONS = 5
 FrameData = tuple[np.ndarray, np.ndarray, np.ndarray]
 CaptureResult = tuple[
     bool,
@@ -500,13 +501,17 @@ class VisionProcessor:
         mode: str,
         nogpu: bool = False,
         max_distance: float = 150.0,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
     ) -> None:
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Modo 2D desconhecido: {mode}")
         if max_distance <= 0:
             raise ValueError("max_distance deve ser maior que zero")
+        if max_connections < 1:
+            raise ValueError("max_connections deve ser pelo menos 1")
         self.mode = mode
         self.max_distance = max_distance
+        self.max_connections = max_connections
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._mog2 = None
         self._previous_gray: Optional[np.ndarray] = None
@@ -673,6 +678,37 @@ class VisionProcessor:
             value = value.numpy()
         return np.asarray(value)
 
+    @staticmethod
+    def _select_mesh_edges(
+        coordinates: np.ndarray,
+        max_distance: float,
+        max_connections: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if len(coordinates) < 2:
+            empty = np.empty(0, dtype=np.intp)
+            return empty, empty, np.empty(0, dtype=np.float32)
+
+        offsets = coordinates[:, None, :] - coordinates[None, :, :]
+        distances = np.sqrt(np.sum(offsets * offsets, axis=2))
+        first, second = np.triu_indices(len(coordinates), k=1)
+        candidates = distances[first, second] < max_distance
+        first, second = first[candidates], second[candidates]
+        edge_distances = distances[first, second]
+        order = np.argsort(edge_distances, kind="stable")
+        degrees = np.zeros(len(coordinates), dtype=np.int32)
+        selected = []
+
+        for edge_index in order:
+            node_a, node_b = int(first[edge_index]), int(second[edge_index])
+            if degrees[node_a] >= max_connections or degrees[node_b] >= max_connections:
+                continue
+            degrees[node_a] += 1
+            degrees[node_b] += 1
+            selected.append(edge_index)
+
+        selected = np.asarray(selected, dtype=np.intp)
+        return first[selected], second[selected], edge_distances[selected]
+
     def _process_yolo(self, frame_bgr: np.ndarray) -> VisionResult:
         height, width = frame_bgr.shape[:2]
         frame_320 = cv2.resize(frame_bgr, (320, 240), interpolation=cv2.INTER_AREA)
@@ -719,12 +755,9 @@ class VisionProcessor:
         nodes = list(raw_nodes.items())
         if nodes:
             coordinates = np.asarray([position for _, position in nodes], dtype=np.float32)
-            offsets = coordinates[:, None, :] - coordinates[None, :, :]
-            distances = np.sqrt(np.sum(offsets * offsets, axis=2))
-            first, second = np.triu_indices(len(nodes), k=1)
-            connected = distances[first, second] < self.max_distance
-            first, second = first[connected], second[connected]
-            edge_distances = distances[first, second]
+            first, second, edge_distances = self._select_mesh_edges(
+                coordinates, self.max_distance, self.max_connections
+            )
 
             for node_a, node_b, distance in zip(first, second, edge_distances):
                 line_alpha = 1.0 - float(distance) / self.max_distance
@@ -838,6 +871,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=150.0,
         help="distancia maxima de conexao entre nos YOLO, em pixels (padrao: 150)",
     )
+    parser.add_argument(
+        "--max-connections",
+        type=int,
+        default=DEFAULT_MAX_CONNECTIONS,
+        help="maximo de ligacoes incidentes por no YOLO (padrao: 5)",
+    )
     parser.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH_MM, help="profundidade minima em mm (padrao: %(default)s)")
     parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH_MM, help="profundidade maxima em mm (padrao: %(default)s)")
     args = parser.parse_args(argv)
@@ -853,6 +892,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         parser.error("--mode kinect requer --source kinect")
     if args.max_distance <= 0:
         parser.error("--max-distance deve ser maior que zero")
+    if args.max_connections < 1:
+        parser.error("--max-connections deve ser pelo menos 1")
     return args
 
 
@@ -867,12 +908,16 @@ def make_vision_processor(
     mode: str,
     nogpu: bool = False,
     max_distance: float = 150.0,
+    max_connections: int = DEFAULT_MAX_CONNECTIONS,
 ) -> Optional[VisionProcessor]:
     return (
         None
         if mode == "kinect"
         else VisionProcessor(
-            mode, nogpu=nogpu, max_distance=max_distance
+            mode,
+            nogpu=nogpu,
+            max_distance=max_distance,
+            max_connections=max_connections,
         )
     )
 
@@ -889,7 +934,10 @@ def main() -> int:
     active_mode = resolve_active_mode(args.mode, capturer)
     try:
         processor = make_vision_processor(
-            active_mode, nogpu=args.nogpu, max_distance=args.max_distance
+            active_mode,
+            nogpu=args.nogpu,
+            max_distance=args.max_distance,
+            max_connections=args.max_connections,
         )
     except Exception as exc:
         capturer.close()
@@ -1032,6 +1080,7 @@ def main() -> int:
                             active_mode,
                             nogpu=args.nogpu,
                             max_distance=args.max_distance,
+                            max_connections=args.max_connections,
                         )
                     elif processor is not None:
                         processor.reset()
