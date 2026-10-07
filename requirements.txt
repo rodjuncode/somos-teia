@@ -1,4 +1,3 @@
 numpy<2
-opencv-contrib-python==4.11.0.86
-# The PoC uses mp.solutions, removed from MediaPipe 1.x.
-mediapipe==0.10.21
+opencv-python==4.11.0.86
+ultralytics

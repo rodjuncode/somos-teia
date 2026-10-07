@@ -12,6 +12,7 @@ Instalacao no Ubuntu (para Kinect, instale primeiro as libs nativas):
 Execute com `python dance_interactive_poc.py`. Pressione q para sair.
 Fonte: --source kinect|webcam|arquivo.mp4; pressione m para alternar as fontes configuradas.
 Use --fallback-video para reserva quando Kinect e webcam falharem.
+Algoritmo: --mode kinect|mog2|optical_flow|yolo. Fontes 2D usam MOG2 por padrao.
 Faixa inicial: --min-depth/--max-depth (mm). Atalhos Kinect: a/z diminuem/aumentam
 Min Depth; s/x diminuem/aumentam Max Depth, em passos de 100 mm. Pressione b
 com a sala vazia para capturar o fundo e recortar apenas o que se move a frente.
@@ -26,6 +27,7 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Optional, Protocol
 
 import cv2
@@ -68,9 +70,6 @@ class CaptureSource(Protocol):
     @property
     def background_active(self) -> bool: ...
 
-    @property
-    def pose_landmarks(self): ...
-
     def adjust_depth(self, min_delta: int = 0, max_delta: int = 0) -> None: ...
 
     def capture_background(self) -> None: ...
@@ -93,18 +92,6 @@ def make_kinect_body_mask(
         )
         mask = cv2.bitwise_and(mask, closer.astype(np.uint8) * 255)
     return mask
-
-
-def import_mediapipe_solutions():
-    import mediapipe as mp
-
-    if not hasattr(mp, "solutions"):
-        raise RuntimeError(
-            f"MediaPipe {getattr(mp, '__version__', 'desconhecido')} nao fornece "
-            "mp.solutions; reinstale as dependencias com "
-            "python -m pip install -r requirements.txt"
-        )
-    return mp
 
 
 class KinectCaptureShutdownError(RuntimeError):
@@ -268,30 +255,19 @@ class KinectV1Capturer:
 
 
 class WebcamCapturer:
-    """Webcam USB with MediaPipe Pose and no body segmentation."""
+    """Webcam USB frame source."""
 
     def __init__(self, camera_index: int = 0) -> None:
-        mp = import_mediapipe_solutions()
-
         self._capture = cv2.VideoCapture(camera_index)
         if not self._capture.isOpened():
             self._capture.release()
             raise RuntimeError("Nao foi possivel abrir a webcam")
 
-        self._pose = mp.solutions.pose.Pose(
-            model_complexity=0,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        self._mp_drawing = mp.solutions.drawing_utils
-        self._mp_pose = mp.solutions.pose
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._frame: Optional[FrameData] = None
         self._frame_captured_at = 0.0
         self._last_read_timestamp = 0.0
-        self._pose_landmarks = None
         self.error: Optional[Exception] = None
         self._thread = threading.Thread(
             target=self._capture_loop, name="webcam-capture", daemon=False
@@ -306,13 +282,11 @@ class WebcamCapturer:
                     raise RuntimeError("Falha ao ler frame da webcam")
                 captured_at = time.perf_counter()
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                pose = self._pose.process(rgb)
                 mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
                 depth = np.zeros(mask.shape, dtype=np.uint16)
                 with self._lock:
                     self._frame = (rgb, depth, mask)
                     self._frame_captured_at = captured_at
-                    self._pose_landmarks = pose.pose_landmarks
         except Exception as exc:
             self.error = exc
             self._stop_event.set()
@@ -328,7 +302,7 @@ class WebcamCapturer:
 
     @property
     def source_label(self) -> str:
-        return "WEBCAM USB (MediaPipe Pose; sem mascara)"
+        return "WEBCAM USB"
 
     @property
     def source_key(self) -> str:
@@ -353,26 +327,18 @@ class WebcamCapturer:
     def depth_range(self) -> tuple[int, int]:
         return 0, 0
 
-    @property
-    def pose_landmarks(self):
-        with self._lock:
-            return self._pose_landmarks
-
     def close(self) -> None:
         self._stop_event.set()
         self._thread.join(timeout=3.0)
         self._capture.release()
-        self._pose.close()
         if self._thread.is_alive():
             raise RuntimeError("A thread da webcam nao encerrou em 3 segundos")
 
 
 class VideoCapturer:
-    """Video file source with MediaPipe Pose and no body mask, looping at its frame rate."""
+    """Video file source that loops at its nominal frame rate."""
 
     def __init__(self, path: str) -> None:
-        mp = import_mediapipe_solutions()
-
         self.path = os.path.abspath(path)
         self._capture = cv2.VideoCapture(self.path)
         if not self._capture.isOpened():
@@ -381,20 +347,11 @@ class VideoCapturer:
 
         fps = self._capture.get(cv2.CAP_PROP_FPS)
         self._frame_period = 1.0 / (fps if 1.0 <= fps <= 120.0 else 30.0)
-        self._pose = mp.solutions.pose.Pose(
-            model_complexity=0,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        self._mp_drawing = mp.solutions.drawing_utils
-        self._mp_pose = mp.solutions.pose
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._frame: Optional[FrameData] = None
         self._frame_captured_at = 0.0
         self._last_read_timestamp = 0.0
-        self._pose_landmarks = None
         self.error: Optional[Exception] = None
         self._thread = threading.Thread(
             target=self._capture_loop, name="video-capture", daemon=False
@@ -414,13 +371,11 @@ class VideoCapturer:
 
                 captured_at = time.perf_counter()
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                pose = self._pose.process(rgb)
                 mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
                 depth = np.zeros(mask.shape, dtype=np.uint16)
                 with self._lock:
                     self._frame = (rgb, depth, mask)
                     self._frame_captured_at = captured_at
-                    self._pose_landmarks = pose.pose_landmarks
 
                 next_frame_at += self._frame_period
                 if next_frame_at < time.perf_counter():
@@ -439,7 +394,7 @@ class VideoCapturer:
 
     @property
     def source_label(self) -> str:
-        return f"VIDEO [{os.path.basename(self.path)}] (MediaPipe Pose; sem mascara)"
+        return f"VIDEO [{os.path.basename(self.path)}]"
 
     @property
     def source_key(self) -> str:
@@ -449,11 +404,6 @@ class VideoCapturer:
     def last_read_timestamp(self) -> float:
         with self._lock:
             return self._last_read_timestamp
-
-    @property
-    def pose_landmarks(self):
-        with self._lock:
-            return self._pose_landmarks
 
     @property
     def depth_range(self) -> tuple[int, int]:
@@ -473,7 +423,6 @@ class VideoCapturer:
         self._stop_event.set()
         self._thread.join(timeout=3.0)
         self._capture.release()
-        self._pose.close()
         if self._thread.is_alive():
             raise RuntimeError("A thread de video nao encerrou em 3 segundos")
 
@@ -491,7 +440,7 @@ def create_capturer(
             return capturer
         except Exception as exc:
             print(
-                f"Aviso: Kinect indisponivel ({exc}); tentando webcam USB + MediaPipe.",
+                f"Aviso: Kinect indisponivel ({exc}); tentando webcam USB + MOG2.",
                 file=sys.stderr,
             )
             try:
@@ -512,6 +461,219 @@ def create_capturer(
     return VideoCapturer(source)
 
 
+@dataclass(slots=True)
+class VisionResult:
+    body_mask: np.ndarray
+    debug_frame: np.ndarray
+    body_frame: np.ndarray
+    center: Optional[tuple[int, int]] = None
+
+
+class VisionProcessor:
+    """Runs one selected 2D algorithm on each new RGB frame."""
+
+    MODE_LABELS = {
+        "mog2": "MOG2 (Subtracao de Fundo)",
+        "optical_flow": "Optical Flow (Farneback)",
+        "yolo": "YOLOv8n-pose",
+    }
+    SKELETON_EDGES = (
+        (5, 7), (7, 9), (6, 8), (8, 10), (5, 6),
+        (5, 11), (6, 12), (11, 12),
+        (11, 13), (13, 15), (12, 14), (14, 16),
+    )
+    MOG2_SCALE = 0.25
+    FLOW_SCALE = 0.125
+    FLOW_THRESHOLD = 0.15
+
+    def __init__(self, mode: str) -> None:
+        if mode not in self.MODE_LABELS:
+            raise ValueError(f"Modo 2D desconhecido: {mode}")
+        self.mode = mode
+        self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        self._mog2 = None
+        self._previous_gray: Optional[np.ndarray] = None
+        self._yolo = None
+        if mode == "mog2":
+            self._reset_mog2()
+        elif mode == "yolo":
+            try:
+                from ultralytics import YOLO
+            except ImportError as exc:
+                raise RuntimeError(
+                    "O modo YOLO requer ultralytics; instale com "
+                    "python -m pip install -r requirements.txt"
+                ) from exc
+            self._yolo = YOLO("yolov8n-pose.pt")
+
+    @property
+    def label(self) -> str:
+        return self.MODE_LABELS[self.mode]
+
+    def _reset_mog2(self) -> None:
+        self._mog2 = cv2.createBackgroundSubtractorMOG2(
+            history=500, varThreshold=16, detectShadows=False
+        )
+
+    def reset(self) -> None:
+        if self.mode == "mog2":
+            self._reset_mog2()
+        elif self.mode == "optical_flow":
+            self._previous_gray = None
+
+    def _clean_mask(self, mask: np.ndarray) -> np.ndarray:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel)
+        return mask
+
+    @staticmethod
+    def _center(mask: np.ndarray) -> Optional[tuple[int, int]]:
+        moments = cv2.moments(mask, binaryImage=True)
+        if moments["m00"] == 0:
+            return None
+        return (
+            int(moments["m10"] / moments["m00"]),
+            int(moments["m01"] / moments["m00"]),
+        )
+
+    @classmethod
+    def _scaled_center(
+        cls, mask: np.ndarray, scale: float
+    ) -> Optional[tuple[int, int]]:
+        center = cls._center(mask)
+        if center is None:
+            return None
+        return int(center[0] / scale), int(center[1] / scale)
+
+    @staticmethod
+    def _empty_result(frame_bgr: np.ndarray) -> VisionResult:
+        height, width = frame_bgr.shape[:2]
+        mask = np.zeros((height, width), dtype=np.uint8)
+        return VisionResult(mask, frame_bgr.copy(), np.zeros_like(frame_bgr))
+
+    def process(self, frame_rgb: np.ndarray) -> VisionResult:
+        if self.mode == "mog2":
+            height, width = frame_rgb.shape[:2]
+            size = (
+                max(1, int(width * self.MOG2_SCALE)),
+                max(1, int(height * self.MOG2_SCALE)),
+            )
+            small_rgb = cv2.resize(frame_rgb, size, interpolation=cv2.INTER_AREA)
+            small_mask = self._clean_mask(self._mog2.apply(small_rgb))
+            mask = cv2.resize(
+                small_mask, (width, height), interpolation=cv2.INTER_NEAREST
+            )
+            debug = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(debug, contours, -1, (0, 255, 0), 1)
+            return VisionResult(
+                mask,
+                debug,
+                make_body_visual(mask, 0.0),
+                self._scaled_center(small_mask, self.MOG2_SCALE),
+            )
+
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        if self.mode == "optical_flow":
+            small_gray = cv2.resize(
+                gray,
+                (
+                    max(1, int(gray.shape[1] * self.FLOW_SCALE)),
+                    max(1, int(gray.shape[0] * self.FLOW_SCALE)),
+                ),
+                interpolation=cv2.INTER_AREA,
+            )
+            result = self._process_flow(frame_rgb, small_gray)
+            self._previous_gray = small_gray
+            return result
+
+        return self._process_yolo(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+
+    def _process_flow(self, frame_rgb: np.ndarray, gray: np.ndarray) -> VisionResult:
+        height, width = frame_rgb.shape[:2]
+        if self._previous_gray is None:
+            return self._empty_result(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+        flow = cv2.calcOpticalFlowFarneback(
+            self._previous_gray, gray, None, 0.5, 1, 5, 1, 5, 1.1, 0
+        )
+        magnitude, _ = cv2.cartToPolar(flow[:, :, 0], flow[:, :, 1])
+        moving = (magnitude > self.FLOW_THRESHOLD).astype(np.uint8) * 255
+        small_mask = self._clean_mask(moving)
+        mask = cv2.resize(
+            small_mask, (width, height), interpolation=cv2.INTER_NEAREST
+        )
+        debug = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        body = np.zeros_like(debug)
+        scale = 1.0 / self.FLOW_SCALE
+        flow_height, flow_width = gray.shape
+        for y in range(3, flow_height, 4):
+            for x in range(3, flow_width, 4):
+                if magnitude[y, x] <= self.FLOW_THRESHOLD:
+                    continue
+                dx, dy = flow[y, x]
+                start = (int(x * scale), int(y * scale))
+                end = (
+                    int((x + dx * 3) * scale),
+                    int((y + dy * 3) * scale),
+                )
+                cv2.arrowedLine(debug, start, end, (0, 255, 255), 1, cv2.LINE_AA)
+                if small_mask[y, x]:
+                    cv2.arrowedLine(body, start, end, (0, 255, 255), 1, cv2.LINE_AA)
+            body = cv2.bitwise_and(body, body, mask=mask)
+        return VisionResult(
+            mask, debug, body, self._scaled_center(small_mask, self.FLOW_SCALE)
+        )
+
+    @staticmethod
+    def _to_numpy(value) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "numpy"):
+            value = value.numpy()
+        return np.asarray(value)
+
+    def _process_yolo(self, frame_bgr: np.ndarray) -> VisionResult:
+        predictions = self._yolo(frame_bgr, verbose=False, imgsz=320)
+        result = predictions[0]
+        height, width = frame_bgr.shape[:2]
+        mask = np.zeros((height, width), dtype=np.uint8)
+        debug = frame_bgr.copy()
+        keypoints = getattr(result, "keypoints", None)
+        points_by_person = self._to_numpy(getattr(keypoints, "xy", None))
+        confidence = self._to_numpy(getattr(keypoints, "conf", None))
+        boxes = self._to_numpy(getattr(getattr(result, "boxes", None), "xyxy", None))
+
+        if boxes is not None:
+            for box in boxes:
+                x1, y1, x2, y2 = np.rint(box[:4]).astype(int)
+                cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 200, 255), 2)
+
+        if points_by_person is not None:
+            for person_index, points in enumerate(points_by_person):
+                valid = np.isfinite(points).all(axis=1) & (points[:, 0] >= 0) & (points[:, 1] >= 0)
+                if confidence is not None and person_index < len(confidence):
+                    valid &= confidence[person_index] >= 0.25
+                integer_points = np.rint(points).astype(int)
+                for start, end in self.SKELETON_EDGES:
+                    if valid[start] and valid[end]:
+                        p1 = tuple(integer_points[start])
+                        p2 = tuple(integer_points[end])
+                        cv2.line(mask, p1, p2, 255, 24, cv2.LINE_AA)
+                        cv2.line(debug, p1, p2, (0, 255, 0), 2, cv2.LINE_AA)
+                for point_index, point in enumerate(integer_points):
+                    if valid[point_index]:
+                        p = tuple(point)
+                        cv2.circle(mask, p, 12, 255, -1, cv2.LINE_AA)
+                        cv2.circle(debug, p, 4, (0, 0, 255), -1, cv2.LINE_AA)
+
+        mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)[1]
+        return VisionResult(mask, debug, make_body_visual(mask, 0.0), self._center(mask))
+
+
 def latency_color(latency_ms: float) -> tuple[int, int, int]:
     if latency_ms <= 35.0:
         return (0, 210, 0)
@@ -520,15 +682,22 @@ def latency_color(latency_ms: float) -> tuple[int, int, int]:
     return (0, 0, 255)
 
 
-def make_floor_visual(mask: np.ndarray, elapsed: float, phase: float) -> np.ndarray:
+def make_floor_visual(
+    mask: np.ndarray,
+    elapsed: float,
+    phase: float,
+    center: Optional[tuple[int, int]] = None,
+) -> np.ndarray:
     height, width = mask.shape
     floor = np.zeros((height, width, 3), dtype=np.uint8)
-    moments = cv2.moments(mask, binaryImage=True)
-    if moments["m00"] > 0:
-        center = (
-            int(moments["m10"] / moments["m00"]),
-            int(moments["m01"] / moments["m00"]),
-        )
+    if center is None:
+        moments = cv2.moments(mask, binaryImage=True)
+        if moments["m00"] > 0:
+            center = (
+                int(moments["m10"] / moments["m00"]),
+                int(moments["m01"] / moments["m00"]),
+            )
+    if center is not None:
         radius = int(30 + (elapsed % 1.5) / 1.5 * max(height, width) * 0.55)
         for ring in range(3):
             current_radius = max(1, radius - ring * 42)
@@ -554,6 +723,7 @@ def make_composite_preview(floor: np.ndarray, body: np.ndarray) -> np.ndarray:
 def draw_debug_overlay(
     debug: np.ndarray,
     source: str,
+    mode: str,
     fps: float,
     latency_ms: float,
     depth_range: tuple[int, int],
@@ -564,6 +734,7 @@ def draw_debug_overlay(
     lines = [
         f"FPS: {fps:.1f}",
         f"Latencia: {latency_ms:.1f} ms",
+        f"Modo Ativo: {mode}",
         f"Min Depth: {min_depth} mm" if max_depth else "Min Depth: N/A",
         f"Max Depth: {max_depth} mm" if max_depth else "Max Depth: N/A",
         (
@@ -575,7 +746,7 @@ def draw_debug_overlay(
         ),
         f"Fonte Ativa: {source}",
     ]
-    cv2.rectangle(debug, (8, 8), (620, 150), (0, 0, 0), -1)
+    cv2.rectangle(debug, (8, 8), (630, 174), (0, 0, 0), -1)
     for index, text in enumerate(lines):
         cv2.putText(
             debug,
@@ -590,7 +761,7 @@ def draw_debug_overlay(
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PoC de danca interativa com Kinect v1 ou webcam.")
+    parser = argparse.ArgumentParser(description="PoC de danca interativa com captura e processamento 2D intercambiaveis.")
     parser.add_argument(
         "--source",
         default="kinect",
@@ -602,6 +773,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         metavar="ARQUIVO",
         help="video MP4/MOV opcional se Kinect e webcam estiverem indisponiveis",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("kinect", "mog2", "optical_flow", "yolo"),
+        default=None,
+        help="algoritmo 2D: kinect, mog2, optical_flow ou yolo (padrao: kinect para Kinect, mog2 para outras fontes)",
+    )
     parser.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH_MM, help="profundidade minima em mm (padrao: %(default)s)")
     parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH_MM, help="profundidade maxima em mm (padrao: %(default)s)")
     args = parser.parse_args(argv)
@@ -611,7 +788,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         parser.error("--source deve ser 'kinect', 'webcam' ou um arquivo MP4/MOV")
     if args.fallback_video and os.path.splitext(args.fallback_video)[1].lower() not in {".mp4", ".mov", ".m4v"}:
         parser.error("--fallback-video deve apontar para um arquivo MP4/MOV")
+    if args.mode is None:
+        args.mode = "kinect" if args.source == "kinect" else "mog2"
+    if args.mode == "kinect" and args.source != "kinect":
+        parser.error("--mode kinect requer --source kinect")
     return args
+
+
+def resolve_active_mode(requested_mode: str, capturer: CaptureSource) -> str:
+    if requested_mode == "kinect" and not isinstance(capturer, KinectV1Capturer):
+        print("Kinect indisponivel; usando MOG2 no modo de fallback.", file=sys.stderr)
+        return "mog2"
+    return requested_mode
+
+
+def make_vision_processor(mode: str) -> Optional[VisionProcessor]:
+    return None if mode == "kinect" else VisionProcessor(mode)
 
 
 def main() -> int:
@@ -622,6 +814,13 @@ def main() -> int:
         )
     except RuntimeError as exc:
         print(f"Erro ao iniciar captura: {exc}", file=sys.stderr)
+        return 1
+    active_mode = resolve_active_mode(args.mode, capturer)
+    try:
+        processor = make_vision_processor(active_mode)
+    except Exception as exc:
+        capturer.close()
+        print(f"Erro ao iniciar modo {active_mode}: {exc}", file=sys.stderr)
         return 1
     video_choice = args.source if args.source not in {"kinect", "webcam"} else args.fallback_video
     source_choices = ["kinect", "webcam"]
@@ -647,62 +846,82 @@ def main() -> int:
     last_latency_ms = 0.0
     phase = 0.0
     start_time = time.perf_counter()
+    last_processed_timestamp: Optional[float] = None
+    cached_images: Optional[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None
     try:
         while True:
             if capturer.error is not None:
                 raise RuntimeError(f"Falha no backend de captura: {capturer.error}")
             success, frame_rgb, depth, body_mask = capturer.read()
             if not success or frame_rgb is None or depth is None or body_mask is None:
-                cv2.waitKey(1)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
                 continue
 
             frame_start = capturer.last_read_timestamp
-            elapsed = frame_start - start_time
-            recent_frame_times.append(time.perf_counter())
-            debug = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            tinted = np.zeros_like(debug)
-            tinted[:, :, 1] = 200
-            overlay = cv2.bitwise_and(tinted, tinted, mask=body_mask)
-            debug = cv2.addWeighted(debug, 1.0, overlay, 0.28, 0.0)
+            is_new_frame = frame_start != last_processed_timestamp
+            if is_new_frame:
+                elapsed = frame_start - start_time
+                recent_frame_times.append(frame_start)
+                if active_mode == "kinect":
+                    debug = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                    tinted = np.zeros_like(debug)
+                    tinted[:, :, 1] = 200
+                    overlay = cv2.bitwise_and(tinted, tinted, mask=body_mask)
+                    debug = cv2.addWeighted(debug, 1.0, overlay, 0.28, 0.0)
+                    contours, _ = cv2.findContours(
+                        body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+                    cv2.drawContours(debug, contours, -1, (40, 230, 255), 1)
+                    vision_result = None
+                else:
+                    vision_result = processor.process(frame_rgb)
+                    body_mask = vision_result.body_mask
+                    debug = vision_result.debug_frame
 
-            landmarks = capturer.pose_landmarks
-            if landmarks is not None:
-                capturer._mp_drawing.draw_landmarks(
-                    debug, landmarks, capturer._mp_pose.POSE_CONNECTIONS
+                fps = (
+                    (len(recent_frame_times) - 1)
+                    / (recent_frame_times[-1] - recent_frame_times[0])
+                    if len(recent_frame_times) > 1
+                    else 0.0
                 )
-            else:
-                contours, _ = cv2.findContours(
-                    body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                depth_range = capturer.depth_range if active_mode == "kinect" else (0, 0)
+                mode_label = (
+                    f"KINECT v1 (Depth RAW: {depth_range[0]}-{depth_range[1]} mm)"
+                    if active_mode == "kinect"
+                    else processor.label
                 )
-                cv2.drawContours(debug, contours, -1, (40, 230, 255), 1)
+                draw_debug_overlay(
+                    debug,
+                    capturer.source_label,
+                    mode_label,
+                    fps,
+                    last_latency_ms,
+                    depth_range,
+                    capturer.background_active if active_mode == "kinect" else False,
+                )
+                center = vision_result.center if vision_result is not None else None
+                floor = make_floor_visual(body_mask, elapsed, phase, center)
+                body = (
+                    vision_result.body_frame
+                    if vision_result is not None
+                    else make_body_visual(body_mask, elapsed)
+                )
+                composite = make_composite_preview(floor, body)
+                cached_images = (debug, floor, body, composite)
+                last_processed_timestamp = frame_start
 
-            fps = (
-                (len(recent_frame_times) - 1)
-                / (recent_frame_times[-1] - recent_frame_times[0])
-                if len(recent_frame_times) > 1
-                else 0.0
-            )
-            depth_range = capturer.depth_range
-            draw_debug_overlay(
-                debug,
-                capturer.source_label,
-                fps,
-                last_latency_ms,
-                depth_range,
-                capturer.background_active,
-            )
-            floor = make_floor_visual(body_mask, elapsed, phase)
-            body = make_body_visual(body_mask, elapsed)
-            composite = make_composite_preview(floor, body)
-
-            cv2.imshow(windows[0], debug)
-            cv2.imshow(windows[1], floor)
-            cv2.imshow(windows[2], body)
-            cv2.imshow(windows[3], composite)
+            if cached_images is None:
+                cv2.waitKey(1)
+                continue
+            for window, image in zip(windows, cached_images):
+                cv2.imshow(window, image)
             key = cv2.waitKey(1) & 0xFF
-            last_latency_ms = (time.perf_counter() - frame_start) * 1000.0
-            recent_latency.append(last_latency_ms)
-            phase += last_latency_ms / 1000.0
+            if is_new_frame:
+                last_latency_ms = (time.perf_counter() - frame_start) * 1000.0
+                recent_latency.append(last_latency_ms)
+            phase += 1.0 / max(fps, 1.0)
             if key == ord("q"):
                 break
             if key == ord("m"):
@@ -747,13 +966,21 @@ def main() -> int:
                     capturer = replacement
 
                 if capturer is not None:
+                    previous_mode = active_mode
+                    active_mode = resolve_active_mode(args.mode, capturer)
+                    if active_mode != previous_mode:
+                        processor = make_vision_processor(active_mode)
+                    elif processor is not None:
+                        processor.reset()
                     recent_frame_times.clear()
                     last_latency_ms = 0.0
                     start_time = time.perf_counter()
+                    last_processed_timestamp = None
+                    cached_images = None
                 continue
             if capturer is None:
                 break
-            if isinstance(capturer, KinectV1Capturer):
+            if isinstance(capturer, KinectV1Capturer) and active_mode == "kinect":
                 if key == ord("a"):
                     capturer.adjust_depth(min_delta=-DEPTH_STEP_MM)
                 elif key == ord("z"):
