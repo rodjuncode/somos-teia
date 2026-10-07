@@ -52,7 +52,7 @@ Ou sem ativá-lo:
 .venv/bin/python dance_interactive_poc.py
 ```
 
-Pressione `q` em uma janela da aplicação para encerrar. A faixa inicial de profundidade vem de `--min-depth` e `--max-depth`, em mm (padrão: 800 a 3000):
+Pressione `q` em uma janela da aplicação para encerrar. Para remover paredes e outros objetos estáticos da máscara, deixe a cena vazia e pressione `b` na janela de debug. A faixa inicial de profundidade vem de `--min-depth` e `--max-depth`, em mm (padrão: 800 a 3000):
 
 ```bash
 python dance_interactive_poc.py --min-depth 1000 --max-depth 2500
@@ -66,14 +66,15 @@ No Kinect, os atalhos alteram a faixa em passos de 100 mm:
 | `z` | Aumenta o limite mínimo |
 | `s` | Reduz o limite máximo |
 | `x` | Aumenta o limite máximo |
+| `b` | Captura/recria o fundo; faça isso com a área de dança vazia |
 
 Esses ajustes só se aplicam ao Kinect. No fallback, a máscara vem da segmentação do MediaPipe; o mapa de profundidade é preenchido com zeros.
 
-**Alcance, fundo e sombra:** no mapa de profundidade, o valor 0 significa "sem leitura" e nunca entra na máscara. Medido nesta unidade (Kinect for Windows), há leituras válidas desde ~410 mm, então o limite mínimo padrão de 800 mm é uma escolha, não um limite do sensor. Quem sai da faixa `Min Depth`–`Max Depth` desaparece das projeções, mas continua visível no vídeo RGB da janela de debug.
+**Calibração do fundo:** ao pressionar `b`, a PoC registra a mediana de 15 frames (cerca de 0,5 s) como fundo estático. A máscara passa a incluir somente pixels dentro de `Min Depth`–`Max Depth` que estejam pelo menos 80 mm mais próximos que o fundo capturado. A parede fica fora da máscara e o dançarino, entre a câmera e a parede, aparece. O overlay mostra `Fundo: calibrado` quando ativo. Faça a captura sem pessoas na área e repita se mover a câmera, a parede ou objetos grandes; se o dançarino estiver presente durante a calibração, ele será tratado como fundo e sumirá da máscara.
 
-Como a máscara é só um corte por distância, **tudo** dentro da faixa entra: se a parede do fundo estiver a 2 m e `Max Depth` for 3000 mm, o fundo inteiro é texturizado e o dançarino não se destaca. Ajuste `Max Depth` para ficar logo atrás da pessoa (ou `Min Depth` logo antes), ou passe `--max-depth`. A "sombra" junto ao corpo é a sombra do projetor infravermelho do Kinect: pixels da borda do corpo, no lado oposto ao emissor, ficam sem leitura (0) e portanto fora da máscara. Isolar o corpo em qualquer distância, sem acertar a faixa, exigiria subtração de fundo ou rastreamento de esqueleto (veja o roadmap).
+Sem calibrar o fundo, a máscara continua sendo apenas um corte por distância e **tudo** dentro da faixa aparece, incluindo parede, chão e móveis. O mapa usa `0` para "sem leitura"; nesta unidade, leituras válidas foram observadas desde ~410 mm. A "sombra" junto ao corpo vem da oclusão do padrão infravermelho do Kinect; pixels sem leitura continuam fora da máscara. A diferença de 80 mm pode ser insuficiente para superfícies que se moveram pouco, ou excessiva para partes muito finas do corpo; os limites Min/Max continuam sendo aplicados.
 
-`Ctrl+C` também solicita o encerramento. A captura Kinect usa chamadas síncronas nativas; o programa envia `sync_stop()` e aguarda a thread por tempo limitado para evitar ficar preso se o driver não responder.
+`Ctrl+C` também solicita o encerramento. A thread de captura Kinect chama `sync_stop()` em seu próprio ciclo de vida; o programa aguarda por tempo limitado para evitar ficar preso se o driver não responder.
 
 ## Janelas e telemetria
 
@@ -103,7 +104,7 @@ Exemplo: `feat(projection): add floor and body composite preview`. Enquanto a ve
 
 1. **Validar hardware e instalação:** testar Kinect 1414/1473, fallback de webcam e encerramento em cada backend.
 2. **Calibrar latência:** documentar timestamp de captura em cada sensor, separar idade do frame de processamento/renderização e medir com ferramenta externa a resposta física do projetor.
-3. **Melhorar interação:** isolar o corpo em qualquer distância (subtração de fundo ou esqueleto), estabilizar o centro de massa, detectar pés/partes do corpo e disparar eventos de onda por movimento.
+3. **Melhorar interação:** ajustar o limiar da subtração de fundo e tratar sombras/oclusões, estabilizar o centro de massa, detectar pés/partes do corpo e disparar eventos de onda por movimento.
 4. **Preparar projeção:** permitir configuração de resolução, posição das janelas, fullscreen por projetor e calibração geométrica.
 5. **Consolidar operação:** adicionar testes automatizados para funções sem hardware e registrar FPS/latência em execuções longas.
 
