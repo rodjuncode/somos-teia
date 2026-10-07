@@ -622,7 +622,15 @@ class VisionProcessor:
         "optical_flow": "Optical Flow (Farneback)",
         "yolo": "YOLOv8n-pose",
     }
-    FACE_KEYPOINTS = (0, 1, 2, 3, 4)
+    NODE_GROUPS = (
+        (17, (0, 1, 2, 3, 4)),
+        (5, (5, 6)),
+        (7, (7, 8)),
+        (9, (9, 10)),
+        (11, (11, 12)),
+        (13, (13, 14)),
+        (15, (15, 16)),
+    )
     MOG2_SCALE = 0.25
     FLOW_SCALE = 0.125
     FLOW_THRESHOLD = 0.15
@@ -885,18 +893,18 @@ class VisionProcessor:
                 )
                 if confidence is not None and person_index < len(confidence):
                     valid &= confidence[person_index] >= 0.25
-                visible_face = points[: len(self.FACE_KEYPOINTS)][
-                    valid[: len(self.FACE_KEYPOINTS)]
-                ]
-                if len(visible_face):
-                    head = visible_face.mean(axis=0)
-                    raw_nodes[(person_index, 17)] = (float(head[0]), float(head[1]))
-                for joint_index in range(5, min(17, len(points))):
-                    if valid[joint_index]:
-                        point = points[joint_index]
-                        raw_nodes[(person_index, joint_index)] = (
-                            float(point[0]), float(point[1])
-                        )
+                for node_class, keypoint_indices in self.NODE_GROUPS:
+                    indices = np.asarray(
+                        [index for index in keypoint_indices if index < len(points)],
+                        dtype=np.intp,
+                    )
+                    visible = indices[valid[indices]]
+                    if visible.size == 0:
+                        continue
+                    point = points[visible].mean(axis=0)
+                    raw_nodes[(person_index, node_class)] = (
+                        float(point[0]), float(point[1])
+                    )
 
         stable_nodes = self._presentation_deadband.apply(raw_nodes)
         debug = frame_bgr.copy()
