@@ -901,7 +901,7 @@ class VisionProcessor:
                     visible = indices[valid[indices]]
                     if visible.size == 0:
                         continue
-                    point = points[visible].mean(axis=0)
+                    point = points[visible[0]]
                     raw_nodes[(person_index, node_class)] = (
                         float(point[0]), float(point[1])
                     )
