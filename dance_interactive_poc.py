@@ -11,7 +11,8 @@ Instalacao no Ubuntu (para Kinect, instale primeiro as libs nativas):
 
 Execute com `python dance_interactive_poc.py`. Pressione q para sair.
 Faixa inicial: --min-depth/--max-depth (mm). Atalhos Kinect: a/z diminuem/aumentam
-Min Depth; s/x diminuem/aumentam Max Depth, em passos de 100 mm.
+Min Depth; s/x diminuem/aumentam Max Depth, em passos de 100 mm. Pressione b
+com a sala vazia para capturar o fundo e recortar apenas o que se move a frente.
 O modo Kinect usa profundidade em milimetros (DEPTH_MM).
 """
 
@@ -33,6 +34,25 @@ KINECT_START_TIMEOUT = 20.0
 DEFAULT_MIN_DEPTH_MM = 800
 DEFAULT_MAX_DEPTH_MM = 3000
 DEPTH_STEP_MM = 100
+BACKGROUND_SAMPLE_COUNT = 15
+BACKGROUND_DIFF_MM = 80
+
+
+def make_kinect_body_mask(
+    depth: np.ndarray,
+    min_depth: int,
+    max_depth: int,
+    background_depth: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    mask = cv2.inRange(depth, min_depth, max_depth)
+    if background_depth is not None:
+        closer = (
+            (depth > 0)
+            & (background_depth > 0)
+            & (background_depth.astype(np.int32) - depth.astype(np.int32) >= BACKGROUND_DIFF_MM)
+        )
+        mask = cv2.bitwise_and(mask, closer.astype(np.uint8) * 255)
+    return mask
 
 
 class KinectCaptureShutdownError(RuntimeError):
@@ -62,6 +82,7 @@ class KinectV1Capturer:
         self._last_read_timestamp = 0.0
         self._min_depth = min_depth
         self._max_depth = max_depth
+        self._background_depth: Optional[np.ndarray] = None
         self.error: Optional[Exception] = None
 
         self._thread = threading.Thread(
@@ -101,7 +122,10 @@ class KinectV1Capturer:
 
                 with self._lock:
                     min_depth, max_depth = self._min_depth, self._max_depth
-                body_mask = cv2.inRange(depth, min_depth, max_depth)
+                    background_depth = self._background_depth
+                body_mask = make_kinect_body_mask(
+                    depth, min_depth, max_depth, background_depth
+                )
                 with self._lock:
                     self._frame = (rgb, depth, body_mask)
                     self._frame_captured_at = time.perf_counter()
@@ -137,6 +161,31 @@ class KinectV1Capturer:
         with self._lock:
             self._min_depth = max(1, min(10000, self._min_depth + min_delta))
             self._max_depth = max(self._min_depth + 1, self._max_depth + max_delta)
+
+    def capture_background(self) -> None:
+        samples = []
+        last_timestamp = -1.0
+        deadline = time.perf_counter() + 5.0
+        while len(samples) < BACKGROUND_SAMPLE_COUNT and time.perf_counter() < deadline:
+            with self._lock:
+                timestamp = self._frame_captured_at
+                if self._frame is not None and timestamp != last_timestamp:
+                    samples.append(self._frame[1].copy())
+                    last_timestamp = timestamp
+            time.sleep(0.002)
+        if len(samples) < BACKGROUND_SAMPLE_COUNT:
+            raise RuntimeError("Nao foi possivel capturar frames suficientes do Kinect")
+
+        background = np.ma.median(
+            np.ma.masked_equal(np.stack(samples), 0), axis=0
+        ).filled(0).astype(np.uint16)
+        with self._lock:
+            self._background_depth = background
+
+    @property
+    def background_active(self) -> bool:
+        with self._lock:
+            return self._background_depth is not None
 
     @property
     def depth_range(self) -> tuple[int, int]:
@@ -229,6 +278,13 @@ class WebcamCapturer:
     def adjust_depth(self, min_delta: int = 0, max_delta: int = 0) -> None:
         return
 
+    def capture_background(self) -> None:
+        raise RuntimeError("A calibracao de fundo requer o Kinect v1")
+
+    @property
+    def background_active(self) -> bool:
+        return False
+
     @property
     def depth_range(self) -> tuple[int, int]:
         return 0, 0
@@ -319,6 +375,7 @@ def draw_debug_overlay(
     fps: float,
     latency_ms: float,
     depth_range: tuple[int, int],
+    background_active: bool,
 ) -> None:
     color = latency_color(latency_ms)
     lines = [
@@ -326,9 +383,10 @@ def draw_debug_overlay(
         f"Latencia: {latency_ms:.1f} ms",
         f"Min Depth: {depth_range[0]} mm",
         f"Max Depth: {depth_range[1]} mm",
+        "Fundo: calibrado" if background_active else "Fundo: pressione B vazio",
         source,
     ]
-    cv2.rectangle(debug, (8, 8), (245, 122), (0, 0, 0), -1)
+    cv2.rectangle(debug, (8, 8), (285, 150), (0, 0, 0), -1)
     for index, text in enumerate(lines):
         cv2.putText(
             debug,
@@ -414,7 +472,14 @@ def main() -> int:
                 else 0.0
             )
             depth_range = capturer.depth_range
-            draw_debug_overlay(debug, source, fps, last_latency_ms, depth_range)
+            draw_debug_overlay(
+                debug,
+                source,
+                fps,
+                last_latency_ms,
+                depth_range,
+                capturer.background_active,
+            )
             floor = make_floor_visual(body_mask, elapsed, phase)
             body = make_body_visual(body_mask, elapsed)
             composite = make_composite_preview(floor, body)
@@ -438,6 +503,14 @@ def main() -> int:
                     capturer.adjust_depth(max_delta=-DEPTH_STEP_MM)
                 elif key == ord("x"):
                     capturer.adjust_depth(max_delta=DEPTH_STEP_MM)
+                elif key == ord("b"):
+                    print("Capture o fundo com a sala vazia; amostrando 15 frames...")
+                    try:
+                        capturer.capture_background()
+                    except RuntimeError as exc:
+                        print(f"Falha ao calibrar fundo: {exc}", file=sys.stderr)
+                    else:
+                        print("Fundo calibrado; apenas objetos mais proximos entrarao na mascara.")
     except KeyboardInterrupt:
         print("\nInterrompido pelo usuario; encerrando captura...", file=sys.stderr)
     finally:
