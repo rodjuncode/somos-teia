@@ -64,7 +64,7 @@ python dance_interactive_poc.py --source ensaio.mp4 --mode mog2
 python dance_interactive_poc.py --source ensaio.mp4 --mode optical_flow
 python dance_interactive_poc.py --source ensaio.mp4 --mode yolo
 python dance_interactive_poc.py --source ensaio.mp4 --mode yolo --nogpu
-python dance_interactive_poc.py --source ensaio.mp4 --mode yolo --max-distance 150 --max-connections 5
+python dance_interactive_poc.py --source ensaio.mp4 --mode yolo --max-distance 150 --max-connections 5 --point-deadband 4
 python dance_interactive_poc.py --source kinect --mode kinect
 ```
 
@@ -72,7 +72,7 @@ Para fontes webcam/vídeo, o modo padrão é `mog2`. `--mode kinect` exige `--so
 
 - **MOG2:** `BackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)` roda em 160×120; a máscara é ampliada ao tamanho original, limpa com abertura/fechamento morfológicos e seu centroide vem dos momentos.
 - **Optical Flow:** Farneback roda em 80×60 entre frames cinza consecutivos; a máscara seleciona movimento acima de 0,15 px nessa escala (~1,2 px na imagem original) e a janela Corpo mostra vetores ampliados e recortados pela máscara.
-- **YOLO:** `yolov8n-pose.pt`, inferência em `imgsz=320`; a cabeça é a média simples do nariz, olhos e orelhas, junto aos nós de ombros, cotovelos, pulsos, quadris, joelhos e tornozelos. Os pontos usam diretamente as coordenadas de cada frame, sem suavização temporal. A malha vetorizada considera pares intra/interpessoais dentro de `--max-distance` (padrão 150 px), prioriza os mais próximos e limita cada nó a `--max-connections` ligações (padrão 5); brilho e espessura variam com a proximidade. Os segmentos rígidos do esqueleto YOLO são ignorados.
+- **YOLO:** `yolov8n-pose.pt`, inferência em `imgsz=320` com até 16 detecções por frame para limitar o pós-processamento; a cabeça é a média simples do nariz, olhos e orelhas, junto aos nós de ombros, cotovelos, pulsos, quadris, joelhos e tornozelos. `--point-deadband` (padrão 4 px) ignora tremor pequeno sem EMA; movimentos maiores avançam no mesmo frame. A malha vetorizada considera pares intra/interpessoais dentro de `--max-distance` (padrão 150 px), prioriza os mais próximos e limita cada nó a `--max-connections` ligações (padrão 5); brilho e espessura variam com a proximidade. Os segmentos rígidos do esqueleto YOLO são ignorados.
 - **YOLO sem GPU:** `--nogpu` prefere OpenVINO/CPU. Se `yolov8n-pose_openvino_model/` não existir, a PoC tenta exportar o `.pt` automaticamente. Se OpenVINO ou a exportação falharem, usa PyTorch CPU e avisa no terminal. Sem `--nogpu`, CUDA disponível tem prioridade.
 - **Kinect:** máscara RAW pela faixa de profundidade, com calibração de fundo opcional pela tecla `b`.
 

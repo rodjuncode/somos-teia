@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PoC de danca interativa com Kinect v1, webcam USB ou arquivo de video.
 
-Instalacao no Ubuntu (para Kinect, instale primeiro as libs nativas):
+Instalação no Ubuntu (para Kinect, instale primeiro as libs nativas):
     sudo apt-get install libfreenect-dev freenect python3-dev python3-venv build-essential
     python3 -m venv .venv
     source .venv/bin/activate
@@ -51,8 +51,6 @@ CaptureResult = tuple[
     Optional[np.ndarray],
     Optional[np.ndarray],
 ]
-
-
 class CaptureSource(Protocol):
     error: Optional[Exception]
 
@@ -472,6 +470,39 @@ class VisionResult:
     body_frame: np.ndarray
 
 
+class PresentationDeadband:
+    def __init__(self, threshold_px: float = 4.0) -> None:
+        if threshold_px < 0:
+            raise ValueError("point_deadband deve ser >= 0")
+        self.threshold_px = threshold_px
+        self._positions: dict[tuple[int, int], np.ndarray] = {}
+
+    def reset(self) -> None:
+        self._positions.clear()
+
+    def apply(
+        self, points: dict[tuple[int, int], tuple[float, float]]
+    ) -> dict[tuple[int, int], tuple[float, float]]:
+        stabilized = {}
+        next_positions = {}
+        for key, position in points.items():
+            current = np.asarray(position, dtype=np.float32)
+            previous = self._positions.get(key)
+            if previous is not None and self.threshold_px > 0:
+                delta = current - previous
+                distance = float(np.linalg.norm(delta))
+                if distance <= self.threshold_px:
+                    current = previous
+                else:
+                    current = previous + delta * (
+                        (distance - self.threshold_px) / distance
+                    )
+            next_positions[key] = current
+            stabilized[key] = (float(current[0]), float(current[1]))
+        self._positions = next_positions
+        return stabilized
+
+
 def export_yolo_openvino_model(yolo_class=None) -> str:
     if os.path.isdir(YOLO_OPENVINO_MODEL):
         return YOLO_OPENVINO_MODEL
@@ -503,6 +534,7 @@ class VisionProcessor:
         nogpu: bool = False,
         max_distance: float = 150.0,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        point_deadband: float = 4.0,
     ) -> None:
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Modo 2D desconhecido: {mode}")
@@ -513,6 +545,7 @@ class VisionProcessor:
         self.mode = mode
         self.max_distance = max_distance
         self.max_connections = max_connections
+        self._presentation_deadband = PresentationDeadband(point_deadband)
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._mog2 = None
         self._previous_gray: Optional[np.ndarray] = None
@@ -589,6 +622,8 @@ class VisionProcessor:
             self._reset_mog2()
         elif self.mode == "optical_flow":
             self._previous_gray = None
+        elif self.mode == "yolo":
+            self._presentation_deadband.reset()
 
     def _clean_mask(self, mask: np.ndarray) -> np.ndarray:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)
@@ -760,10 +795,11 @@ class VisionProcessor:
                             float(point[0]), float(point[1])
                         )
 
+        stable_nodes = self._presentation_deadband.apply(raw_nodes)
         debug = frame_bgr.copy()
         body = np.zeros_like(frame_bgr)
         mask = np.zeros((height, width), dtype=np.uint8)
-        nodes = list(raw_nodes.items())
+        nodes = list(stable_nodes.items())
         if nodes:
             coordinates = np.asarray([position for _, position in nodes], dtype=np.float32)
             first, second, edge_distances = self._select_mesh_edges(
@@ -887,6 +923,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=DEFAULT_MAX_CONNECTIONS,
         help="maximo de ligacoes incidentes por no YOLO (padrao: 5)",
     )
+    parser.add_argument(
+        "--point-deadband",
+        type=float,
+        default=4.0,
+        help="limiar espacial para ignorar tremor dos nos YOLO, em pixels (padrao: 4)",
+    )
     parser.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH_MM, help="profundidade minima em mm (padrao: %(default)s)")
     parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH_MM, help="profundidade maxima em mm (padrao: %(default)s)")
     args = parser.parse_args(argv)
@@ -904,6 +946,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         parser.error("--max-distance deve ser maior que zero")
     if args.max_connections < 1:
         parser.error("--max-connections deve ser pelo menos 1")
+    if args.point_deadband < 0:
+        parser.error("--point-deadband deve ser >= 0")
     return args
 
 
@@ -919,6 +963,7 @@ def make_vision_processor(
     nogpu: bool = False,
     max_distance: float = 150.0,
     max_connections: int = DEFAULT_MAX_CONNECTIONS,
+    point_deadband: float = 4.0,
 ) -> Optional[VisionProcessor]:
     return (
         None
@@ -928,6 +973,7 @@ def make_vision_processor(
             nogpu=nogpu,
             max_distance=max_distance,
             max_connections=max_connections,
+            point_deadband=point_deadband,
         )
     )
 
@@ -948,6 +994,7 @@ def main() -> int:
             nogpu=args.nogpu,
             max_distance=args.max_distance,
             max_connections=args.max_connections,
+            point_deadband=args.point_deadband,
         )
     except Exception as exc:
         capturer.close()
@@ -1091,6 +1138,7 @@ def main() -> int:
                             nogpu=args.nogpu,
                             max_distance=args.max_distance,
                             max_connections=args.max_connections,
+                            point_deadband=args.point_deadband,
                         )
                     elif processor is not None:
                         processor.reset()
