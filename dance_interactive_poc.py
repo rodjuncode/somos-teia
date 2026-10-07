@@ -654,21 +654,43 @@ class VisionProcessor:
 
         if points_by_person is not None:
             for person_index, points in enumerate(points_by_person):
-                valid = np.isfinite(points).all(axis=1) & (points[:, 0] >= 0) & (points[:, 1] >= 0)
+                valid = (
+                    np.isfinite(points).all(axis=1)
+                    & (points[:, 0] >= 0)
+                    & (points[:, 0] < width)
+                    & (points[:, 1] >= 0)
+                    & (points[:, 1] < height)
+                )
                 if confidence is not None and person_index < len(confidence):
                     valid &= confidence[person_index] >= 0.25
-                integer_points = np.rint(points).astype(int)
+                integer_points = np.rint(
+                    np.nan_to_num(points, nan=-1.0, posinf=-1.0, neginf=-1.0)
+                ).astype(int)
                 for start, end in self.SKELETON_EDGES:
                     if valid[start] and valid[end]:
                         p1 = tuple(integer_points[start])
                         p2 = tuple(integer_points[end])
                         cv2.line(mask, p1, p2, 255, 24, cv2.LINE_AA)
-                        cv2.line(debug, p1, p2, (0, 255, 0), 2, cv2.LINE_AA)
-                for point_index, point in enumerate(integer_points):
+                        cv2.line(debug, p1, p2, (0, 0, 255), 1, cv2.LINE_AA)
+                for point_index in range(5, len(integer_points)):
+                    point = integer_points[point_index]
                     if valid[point_index]:
                         p = tuple(point)
                         cv2.circle(mask, p, 12, 255, -1, cv2.LINE_AA)
-                        cv2.circle(debug, p, 4, (0, 0, 255), -1, cv2.LINE_AA)
+                        cv2.circle(debug, p, 4, (0, 255, 0), -1, cv2.LINE_AA)
+
+                visible_head = integer_points[:5][valid[:5]]
+                if len(visible_head):
+                    head_center_array = np.rint(visible_head.mean(axis=0)).astype(int)
+                    head_center = tuple(head_center_array)
+                    radius = max(
+                        8,
+                        int(
+                            np.linalg.norm(visible_head - head_center_array, axis=1).max()
+                            + 5
+                        ),
+                    )
+                    cv2.circle(debug, head_center, radius, (0, 0, 255), 1, cv2.LINE_AA)
 
         mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)[1]
         return VisionResult(mask, debug, make_body_visual(mask, 0.0), self._center(mask))
