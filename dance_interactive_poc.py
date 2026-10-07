@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PoC de danca interativa com Kinect v1 ou webcam.
+"""PoC de danca interativa com Kinect v1, webcam USB ou arquivo de video.
 
 Instalacao no Ubuntu (para Kinect, instale primeiro as libs nativas):
     sudo apt-get install libfreenect-dev freenect python3-dev python3-venv build-essential
@@ -10,6 +10,8 @@ Instalacao no Ubuntu (para Kinect, instale primeiro as libs nativas):
     python -m pip install -r requirements-kinect.txt
 
 Execute com `python dance_interactive_poc.py`. Pressione q para sair.
+Fonte: --source kinect|webcam|arquivo.mp4; pressione m para alternar as fontes configuradas.
+Use --fallback-video para reserva quando Kinect e webcam falharem.
 Faixa inicial: --min-depth/--max-depth (mm). Atalhos Kinect: a/z diminuem/aumentam
 Min Depth; s/x diminuem/aumentam Max Depth, em passos de 100 mm. Pressione b
 com a sala vazia para capturar o fundo e recortar apenas o que se move a frente.
@@ -19,11 +21,12 @@ O modo Kinect usa profundidade em milimetros (DEPTH_MM).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 import time
 from collections import deque
-from typing import Optional
+from typing import Optional, Protocol
 
 import cv2
 import numpy as np
@@ -36,6 +39,43 @@ DEFAULT_MAX_DEPTH_MM = 3000
 DEPTH_STEP_MM = 100
 BACKGROUND_SAMPLE_COUNT = 15
 BACKGROUND_DIFF_MM = 80
+FrameData = tuple[np.ndarray, np.ndarray, np.ndarray]
+CaptureResult = tuple[
+    bool,
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+]
+
+
+class CaptureSource(Protocol):
+    error: Optional[Exception]
+
+    @property
+    def source_key(self) -> str: ...
+
+    def read(self) -> CaptureResult: ...
+
+    @property
+    def source_label(self) -> str: ...
+
+    @property
+    def last_read_timestamp(self) -> float: ...
+
+    @property
+    def depth_range(self) -> tuple[int, int]: ...
+
+    @property
+    def background_active(self) -> bool: ...
+
+    @property
+    def pose_landmarks(self): ...
+
+    def adjust_depth(self, min_delta: int = 0, max_delta: int = 0) -> None: ...
+
+    def capture_background(self) -> None: ...
+
+    def close(self) -> None: ...
 
 
 def make_kinect_body_mask(
@@ -77,7 +117,7 @@ class KinectV1Capturer:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
-        self._frame: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+        self._frame: Optional[FrameData] = None
         self._frame_captured_at = 0.0
         self._last_read_timestamp = 0.0
         self._min_depth = min_depth
@@ -118,7 +158,7 @@ class KinectV1Capturer:
                 rgb, _ = video_packet
                 # O array do driver e liberado em sync_stop(); copiar evita acesso a memoria invalida.
                 depth = np.array(depth, copy=True)
-                rgb = cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
+                rgb = np.array(rgb, copy=True)
 
                 with self._lock:
                     min_depth, max_depth = self._min_depth, self._max_depth
@@ -144,13 +184,21 @@ class KinectV1Capturer:
 
     def read(
         self,
-    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Retorna imediatamente o RGB, profundidade em mm e mascara mais recentes."""
+    ) -> CaptureResult:
         with self._lock:
             if self._frame is None:
-                return None
+                return False, None, None, None
             self._last_read_timestamp = self._frame_captured_at
-            return self._frame
+            return (True, *self._frame)
+
+    @property
+    def source_label(self) -> str:
+        min_depth, max_depth = self.depth_range
+        return f"KINECT v1 (Depth RAW: {min_depth}-{max_depth} mm)"
+
+    @property
+    def source_key(self) -> str:
+        return "kinect"
 
     @property
     def last_read_timestamp(self) -> float:
@@ -208,7 +256,7 @@ class KinectV1Capturer:
 
 
 class WebcamCapturer:
-    """Fallback de webcam com segmentacao e landmarks de pose MediaPipe."""
+    """Webcam USB with segmentation and pose landmarks from MediaPipe."""
 
     def __init__(self, camera_index: int = 0) -> None:
         import mediapipe as mp
@@ -231,7 +279,7 @@ class WebcamCapturer:
         self._mp_pose = mp.solutions.pose
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
-        self._frame: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+        self._frame: Optional[FrameData] = None
         self._frame_captured_at = 0.0
         self._last_read_timestamp = 0.0
         self._pose_landmarks = None
@@ -254,7 +302,7 @@ class WebcamCapturer:
                 mask = (segmentation.segmentation_mask > 0.4).astype(np.uint8) * 255
                 depth = np.zeros(mask.shape, dtype=np.uint16)
                 with self._lock:
-                    self._frame = (bgr, depth, mask)
+                    self._frame = (rgb, depth, mask)
                     self._frame_captured_at = captured_at
                     self._pose_landmarks = pose.pose_landmarks
         except Exception as exc:
@@ -263,12 +311,20 @@ class WebcamCapturer:
 
     def read(
         self,
-    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    ) -> CaptureResult:
         with self._lock:
             if self._frame is None:
-                return None
+                return False, None, None, None
             self._last_read_timestamp = self._frame_captured_at
-            return self._frame
+            return (True, *self._frame)
+
+    @property
+    def source_label(self) -> str:
+        return "WEBCAM USB (MediaPipe Seg)"
+
+    @property
+    def source_key(self) -> str:
+        return "webcam"
 
     @property
     def last_read_timestamp(self) -> float:
@@ -304,22 +360,154 @@ class WebcamCapturer:
             raise RuntimeError("A thread da webcam nao encerrou em 3 segundos")
 
 
-def create_capturer(min_depth: int = DEFAULT_MIN_DEPTH_MM, max_depth: int = DEFAULT_MAX_DEPTH_MM):
-    try:
-        capturer = KinectV1Capturer(min_depth, max_depth)
-        print("Kinect v1 detectado; usando profundidade em milimetros.")
-        return capturer, "Kinect v1"
-    except Exception as exc:
-        print(f"Kinect v1 indisponivel ({exc}); tentando webcam + MediaPipe.")
+class VideoCapturer:
+    """Video file source that loops at its nominal frame rate."""
+
+    def __init__(self, path: str) -> None:
+        import mediapipe as mp
+
+        self.path = os.path.abspath(path)
+        self._capture = cv2.VideoCapture(self.path)
+        if not self._capture.isOpened():
+            self._capture.release()
+            raise RuntimeError(f"Nao foi possivel abrir o video: {self.path}")
+
+        fps = self._capture.get(cv2.CAP_PROP_FPS)
+        self._frame_period = 1.0 / (fps if 1.0 <= fps <= 120.0 else 30.0)
+        self._segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(
+            model_selection=1
+        )
+        self._pose = mp.solutions.pose.Pose(
+            model_complexity=0,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self._mp_drawing = mp.solutions.drawing_utils
+        self._mp_pose = mp.solutions.pose
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._frame: Optional[FrameData] = None
+        self._frame_captured_at = 0.0
+        self._last_read_timestamp = 0.0
+        self._pose_landmarks = None
+        self.error: Optional[Exception] = None
+        self._thread = threading.Thread(
+            target=self._capture_loop, name="video-capture", daemon=False
+        )
+        self._thread.start()
+
+    def _capture_loop(self) -> None:
+        next_frame_at = time.perf_counter()
         try:
-            capturer = WebcamCapturer()
-        except Exception as webcam_error:
-            raise RuntimeError(
-                f"Nenhum backend de captura disponivel. "
-                f"Kinect: {exc}. Webcam: {webcam_error}."
-            ) from webcam_error
-        print("Webcam ativa com segmentacao e pose MediaPipe.")
-        return capturer, "Webcam + MediaPipe"
+            while not self._stop_event.is_set():
+                ok, bgr = self._capture.read()
+                if not ok:
+                    self._capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ok, bgr = self._capture.read()
+                    if not ok:
+                        raise RuntimeError(f"O arquivo de video esta vazio: {self.path}")
+
+                captured_at = time.perf_counter()
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                segmentation = self._segmenter.process(rgb)
+                pose = self._pose.process(rgb)
+                mask = (segmentation.segmentation_mask > 0.4).astype(np.uint8) * 255
+                depth = np.zeros(mask.shape, dtype=np.uint16)
+                with self._lock:
+                    self._frame = (rgb, depth, mask)
+                    self._frame_captured_at = captured_at
+                    self._pose_landmarks = pose.pose_landmarks
+
+                next_frame_at += self._frame_period
+                if next_frame_at < time.perf_counter():
+                    next_frame_at = time.perf_counter()
+                self._stop_event.wait(max(0.0, next_frame_at - time.perf_counter()))
+        except Exception as exc:
+            self.error = exc
+            self._stop_event.set()
+
+    def read(self) -> CaptureResult:
+        with self._lock:
+            if self._frame is None:
+                return False, None, None, None
+            self._last_read_timestamp = self._frame_captured_at
+            return (True, *self._frame)
+
+    @property
+    def source_label(self) -> str:
+        return f"VIDEO [{os.path.basename(self.path)}] (MediaPipe Seg)"
+
+    @property
+    def source_key(self) -> str:
+        return self.path
+
+    @property
+    def last_read_timestamp(self) -> float:
+        with self._lock:
+            return self._last_read_timestamp
+
+    @property
+    def pose_landmarks(self):
+        with self._lock:
+            return self._pose_landmarks
+
+    @property
+    def depth_range(self) -> tuple[int, int]:
+        return 0, 0
+
+    @property
+    def background_active(self) -> bool:
+        return False
+
+    def adjust_depth(self, min_delta: int = 0, max_delta: int = 0) -> None:
+        return
+
+    def capture_background(self) -> None:
+        raise RuntimeError("A calibracao de fundo requer o Kinect v1")
+
+    def close(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=3.0)
+        self._capture.release()
+        self._segmenter.close()
+        self._pose.close()
+        if self._thread.is_alive():
+            raise RuntimeError("A thread de video nao encerrou em 3 segundos")
+
+
+def create_capturer(
+    source: str = "kinect",
+    min_depth: int = DEFAULT_MIN_DEPTH_MM,
+    max_depth: int = DEFAULT_MAX_DEPTH_MM,
+    fallback_video: Optional[str] = None,
+) -> CaptureSource:
+    if source == "kinect":
+        try:
+            capturer = KinectV1Capturer(min_depth, max_depth)
+            print("Kinect v1 detectado; usando profundidade em milimetros.")
+            return capturer
+        except Exception as exc:
+            print(
+                f"Aviso: Kinect indisponivel ({exc}); tentando webcam USB + MediaPipe.",
+                file=sys.stderr,
+            )
+            try:
+                return WebcamCapturer()
+            except Exception as webcam_error:
+                if fallback_video:
+                    print("Webcam indisponivel; tentando video de fallback.", file=sys.stderr)
+                    return VideoCapturer(fallback_video)
+                raise RuntimeError(
+                    f"Kinect indisponivel: {exc}. Webcam indisponivel: {webcam_error}. "
+                    "Use --fallback-video caminho.mp4 para uma fonte de reserva."
+                ) from webcam_error
+
+    if source == "webcam":
+        return WebcamCapturer()
+    if os.path.splitext(source)[1].lower() not in {".mp4", ".mov", ".m4v"}:
+        raise ValueError("--source deve ser 'kinect', 'webcam' ou um arquivo MP4/MOV")
+    return VideoCapturer(source)
 
 
 def latency_color(latency_ms: float) -> tuple[int, int, int]:
@@ -378,15 +566,16 @@ def draw_debug_overlay(
     background_active: bool,
 ) -> None:
     color = latency_color(latency_ms)
+    min_depth, max_depth = depth_range
     lines = [
         f"FPS: {fps:.1f}",
         f"Latencia: {latency_ms:.1f} ms",
-        f"Min Depth: {depth_range[0]} mm",
-        f"Max Depth: {depth_range[1]} mm",
+        f"Min Depth: {min_depth} mm" if max_depth else "Min Depth: N/A",
+        f"Max Depth: {max_depth} mm" if max_depth else "Max Depth: N/A",
         "Fundo: calibrado" if background_active else "Fundo: pressione B vazio",
-        source,
+        f"Fonte Ativa: {source}",
     ]
-    cv2.rectangle(debug, (8, 8), (285, 150), (0, 0, 0), -1)
+    cv2.rectangle(debug, (8, 8), (620, 150), (0, 0, 0), -1)
     for index, text in enumerate(lines):
         cv2.putText(
             debug,
@@ -402,21 +591,44 @@ def draw_debug_overlay(
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PoC de danca interativa com Kinect v1 ou webcam.")
+    parser.add_argument(
+        "--source",
+        default="kinect",
+        metavar="FONTE",
+        help="kinect, webcam ou caminho MP4/MOV (padrao: kinect; tecla m alterna fontes)",
+    )
+    parser.add_argument(
+        "--fallback-video",
+        metavar="ARQUIVO",
+        help="video MP4/MOV opcional se Kinect e webcam estiverem indisponiveis",
+    )
     parser.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH_MM, help="profundidade minima em mm (padrao: %(default)s)")
     parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH_MM, help="profundidade maxima em mm (padrao: %(default)s)")
     args = parser.parse_args(argv)
     if not 1 <= args.min_depth < args.max_depth:
         parser.error("--min-depth deve ser >= 1 e menor que --max-depth")
+    if args.source not in {"kinect", "webcam"} and os.path.splitext(args.source)[1].lower() not in {".mp4", ".mov", ".m4v"}:
+        parser.error("--source deve ser 'kinect', 'webcam' ou um arquivo MP4/MOV")
+    if args.fallback_video and os.path.splitext(args.fallback_video)[1].lower() not in {".mp4", ".mov", ".m4v"}:
+        parser.error("--fallback-video deve apontar para um arquivo MP4/MOV")
     return args
 
 
 def main() -> int:
     args = parse_args()
     try:
-        capturer, source = create_capturer(args.min_depth, args.max_depth)
+        capturer = create_capturer(
+            args.source, args.min_depth, args.max_depth, args.fallback_video
+        )
     except RuntimeError as exc:
         print(f"Erro ao iniciar captura: {exc}", file=sys.stderr)
         return 1
+    video_choice = args.source if args.source not in {"kinect", "webcam"} else args.fallback_video
+    source_choices = ["kinect", "webcam"]
+    if video_choice:
+        video_choice = os.path.abspath(video_choice)
+        if video_choice not in source_choices:
+            source_choices.append(video_choice)
     windows = (
         "Debug & Tracking",
         "Projetor 1 - Chao/Fundo",
@@ -439,16 +651,15 @@ def main() -> int:
         while True:
             if capturer.error is not None:
                 raise RuntimeError(f"Falha no backend de captura: {capturer.error}")
-            packet = capturer.read()
-            if packet is None:
+            success, frame_rgb, depth, body_mask = capturer.read()
+            if not success or frame_rgb is None or depth is None or body_mask is None:
                 cv2.waitKey(1)
                 continue
 
-            rgb, depth, body_mask = packet
             frame_start = capturer.last_read_timestamp
             elapsed = frame_start - start_time
             recent_frame_times.append(time.perf_counter())
-            debug = rgb.copy()
+            debug = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             tinted = np.zeros_like(debug)
             tinted[:, :, 1] = 200
             overlay = cv2.bitwise_and(tinted, tinted, mask=body_mask)
@@ -474,7 +685,7 @@ def main() -> int:
             depth_range = capturer.depth_range
             draw_debug_overlay(
                 debug,
-                source,
+                capturer.source_label,
                 fps,
                 last_latency_ms,
                 depth_range,
@@ -494,7 +705,55 @@ def main() -> int:
             phase += last_latency_ms / 1000.0
             if key == ord("q"):
                 break
-            if source == "Kinect v1":
+            if key == ord("m"):
+                previous = capturer
+                previous_key = previous.source_key
+                next_index = (source_choices.index(previous_key) + 1) % len(source_choices)
+                next_key = source_choices[next_index]
+                print(f"Alternando fonte: {previous.source_label} -> {next_key}")
+
+                if next_key == "kinect":
+                    previous.close()
+                    capturer = None
+                    try:
+                        capturer = create_capturer(
+                            next_key,
+                            args.min_depth,
+                            args.max_depth,
+                            args.fallback_video,
+                        )
+                    except Exception as exc:
+                        print(f"Falha ao trocar para Kinect: {exc}", file=sys.stderr)
+                        try:
+                            capturer = create_capturer(
+                                previous_key, args.min_depth, args.max_depth
+                            )
+                        except Exception as restore_error:
+                            capturer = None
+                            print(
+                                f"Nao foi possivel restaurar {previous_key}: {restore_error}",
+                                file=sys.stderr,
+                            )
+                            break
+                else:
+                    try:
+                        replacement = create_capturer(
+                            next_key, args.min_depth, args.max_depth
+                        )
+                    except Exception as exc:
+                        print(f"Falha ao trocar para {next_key}: {exc}", file=sys.stderr)
+                        continue
+                    previous.close()
+                    capturer = replacement
+
+                if capturer is not None:
+                    recent_frame_times.clear()
+                    last_latency_ms = 0.0
+                    start_time = time.perf_counter()
+                continue
+            if capturer is None:
+                break
+            if isinstance(capturer, KinectV1Capturer):
                 if key == ord("a"):
                     capturer.adjust_depth(min_delta=-DEPTH_STEP_MM)
                 elif key == ord("z"):
@@ -514,7 +773,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nInterrompido pelo usuario; encerrando captura...", file=sys.stderr)
     finally:
-        capturer.close()
+        if capturer is not None:
+            capturer.close()
         cv2.destroyAllWindows()
     return 0
 
