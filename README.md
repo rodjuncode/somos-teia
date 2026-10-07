@@ -1,13 +1,15 @@
 # Dança Interativa: PoC
 
-Prova de conceito em Python para explorar visuais generativos dirigidos pelo movimento, usando Kinect v1 (1414/1473) ou webcam como fallback.
+Prova de conceito em Python para explorar visuais generativos dirigidos pelo movimento, usando Kinect v1 (1414/1473), webcam USB ou arquivo MP4/MOV.
 
 ## Estado atual
 
 O protótipo em [`dance_interactive_poc.py`](dance_interactive_poc.py) já implementa:
 
 - Captura contínua em thread separada, mantendo o frame mais recente disponível para o loop visual.
-- Seleção do Kinect v1 quando o `freenect` e o dispositivo estão acessíveis; caso contrário, tenta webcam com MediaPipe Pose e Selfie Segmentation.
+- Três fontes intercambiáveis pela CLI e pela tecla `m`: Kinect v1, webcam USB e arquivo MP4/MOV em loop.
+- Fallback automático de Kinect para webcam e, opcionalmente, arquivo de vídeo.
+- Saída padronizada de todos os capturadores: sucesso, frame RGB, profundidade real ou matriz dummy e máscara corporal.
 - Máscara binária por faixa de profundidade no Kinect, configurada inicialmente entre 800 e 3000 mm (ajustável por linha de comando e por atalhos).
 - Overlay de máscara/contornos ou landmarks, FPS, faixa de profundidade e latência estimada.
 - Quatro janelas OpenCV: debug, visual de chão, padrão generativo recortado pela máscara do corpo e uma simulação com os dois projetores sobrepostos.
@@ -21,38 +23,39 @@ O script passou por compilação sintática no ambiente virtual. Ainda não houv
 - Para Kinect v1: dispositivo conectado, bibliotecas de desenvolvimento `libfreenect` e binding Python `freenect`.
 - Para webcam/fallback: câmera acessível e dependências Python do [`requirements.txt`](requirements.txt).
 
-O Kinect requer bibliotecas nativas do sistema e uma binding Python dentro do venv. O pacote apt `freenect` instala a biblioteca nativa e suas dependências; a binding Python é instalada pelo [`requirements-kinect.txt`](requirements-kinect.txt). Não é necessário expor pacotes globais ao ambiente virtual.
+O Kinect requer a biblioteca nativa `libfreenect` e headers de desenvolvimento; a binding Python e as demais dependências ficam isoladas no venv. O pacote `python3-freenect` não é usado.
 
 ```bash
 sudo apt-get update
-sudo apt-get install libfreenect-dev freenect python3-dev python3-venv build-essential
+sudo apt-get install libfreenect-dev libfreenect-bin python3-dev python3-venv build-essential
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-# Opcional: binding Kinect v1 (requer as bibliotecas nativas acima)
-python -m pip install -r requirements-kinect.txt
+python -m pip install cython freenect opencv-python numpy mediapipe
 ```
 
-`requirements.txt` contém `opencv-python`, `numpy` e `mediapipe`; `requirements-kinect.txt` inclui esse conjunto e adiciona a binding `freenect`. O build da binding usa Cython conforme os metadados do pacote. Para usar apenas webcam, basta instalar `requirements.txt` e pular os pacotes apt específicos do Kinect e `requirements-kinect.txt`.
+O comando pip instala tudo dentro do venv. Os mesmos pacotes estão listados em [`requirements-kinect.txt`](requirements-kinect.txt); para usar somente webcam ou vídeo, sem Kinect, basta `python -m pip install -r requirements.txt`.
 
 Para conferir a binding antes de conectar a câmera, execute `python -c "import freenect; print('freenect importado')"` dentro do venv. A disponibilidade do dispositivo e as permissões USB ainda precisam ser verificadas no hardware usado.
 
 ## Executar
 
-Com o ambiente ativado:
+Com o ambiente ativado, a fonte padrão é Kinect, com fallback automático para webcam:
 
 ```bash
 python dance_interactive_poc.py
 ```
 
-Ou sem ativá-lo:
+Escolha explicitamente a fonte:
 
 ```bash
-.venv/bin/python dance_interactive_poc.py
+python dance_interactive_poc.py --source kinect
+python dance_interactive_poc.py --source webcam
+python dance_interactive_poc.py --source ensaio.mp4
+python dance_interactive_poc.py --source kinect --fallback-video ensaio.mp4
 ```
 
-Pressione `q` em uma janela da aplicação para encerrar. Para remover paredes e outros objetos estáticos da máscara, deixe a cena vazia e pressione `b` na janela de debug. A faixa inicial de profundidade vem de `--min-depth` e `--max-depth`, em mm (padrão: 800 a 3000):
+MP4, MOV e M4V são reproduzidos em loop. Pressione `m` para alternar, sem fechar o programa, entre Kinect, webcam e o vídeo configurado (por `--source` ou `--fallback-video`). Se o Kinect selecionado não iniciar, a aplicação tenta webcam e depois o vídeo informado em `--fallback-video`. Pressione `q` para sair. Para remover paredes e outros objetos estáticos da máscara no Kinect, deixe a cena vazia e pressione `b` na janela de debug. A faixa inicial de profundidade vem de `--min-depth` e `--max-depth`, em mm (padrão: 800 a 3000):
 
 ```bash
 python dance_interactive_poc.py --min-depth 1000 --max-depth 2500
@@ -74,11 +77,11 @@ Esses ajustes só se aplicam ao Kinect. No fallback, a máscara vem da segmenta�
 
 Sem calibrar o fundo, a máscara continua sendo apenas um corte por distância e **tudo** dentro da faixa aparece, incluindo parede, chão e móveis. O mapa usa `0` para "sem leitura"; nesta unidade, leituras válidas foram observadas desde ~410 mm. A "sombra" junto ao corpo vem da oclusão do padrão infravermelho do Kinect; pixels sem leitura continuam fora da máscara. A diferença de 80 mm pode ser insuficiente para superfícies que se moveram pouco, ou excessiva para partes muito finas do corpo; os limites Min/Max continuam sendo aplicados.
 
-`Ctrl+C` também solicita o encerramento. A thread de captura Kinect chama `sync_stop()` em seu próprio ciclo de vida; o programa aguarda por tempo limitado para evitar ficar preso se o driver não responder.
+Todos os capturadores entregam ao loop principal `(success, frame_rgb, depth_or_dummy, body_mask)`. Webcam e vídeo preenchem `depth_or_dummy` com zeros. `Ctrl+C` também solicita o encerramento.
 
 ## Janelas e telemetria
 
-- **Debug & Tracking:** vídeo com máscara/landmarks e FPS, latência e limites do sensor.
+- **Debug & Tracking:** vídeo com máscara/landmarks, FPS, latência, limites do sensor e fonte ativa.
 - **Projetor 1 - Chão/Fundo:** ondas e círculos guiados pelo centro de massa da máscara.
 - **Projetor 2 - Corpo/Frontal:** padrão generativo aplicado apenas dentro da máscara binária.
 - **Simulação - Chão + Corpo:** pré-visualização de como os dois projetores ficam sobrepostos. As imagens são somadas (com saturação em 255), como a luz de dois projetores; fora da silhueta aparece só o chão. É uma janela comum, não em tela cheia, e não depende de um segundo monitor.
@@ -102,7 +105,7 @@ Exemplo: `feat(projection): add floor and body composite preview`. Enquanto a ve
 
 ## Roadmap
 
-1. **Validar hardware e instalação:** testar Kinect 1414/1473, fallback de webcam e encerramento em cada backend.
+1. **Validar hardware e instalação:** testar Kinect 1414/1473, webcam, arquivos de vídeo em loop e encerramento em cada backend.
 2. **Calibrar latência:** documentar timestamp de captura em cada sensor, separar idade do frame de processamento/renderização e medir com ferramenta externa a resposta física do projetor.
 3. **Melhorar interação:** ajustar o limiar da subtração de fundo e tratar sombras/oclusões, estabilizar o centro de massa, detectar pés/partes do corpo e disparar eventos de onda por movimento.
 4. **Preparar projeção:** permitir configuração de resolução, posição das janelas, fullscreen por projetor e calibração geométrica.
@@ -120,6 +123,6 @@ Exemplo: `feat(projection): add floor and body composite preview`. Enquanto a ve
 
 **Partida lenta é normal neste equipamento:** o primeiro frame do Kinect chega em ~6 a 8 s depois de abrir o dispositivo (medido; depois disso a captura mantém 30 fps). A PoC espera até 20 s antes de considerar o Kinect indisponível. Um `Lost N total packets` isolado no início do stream e um `Expected 1748 data bytes` ocasional são esperados e não indicam defeito; o sinal de problema é perda contínua, `resyncing` ou `control transfer failed` repetidos.
 
-O fallback para webcam é feito apenas na inicialização. Se nem Kinect nem webcam estiverem disponíveis, a PoC encerra com uma mensagem indicando os dois erros. Confirme a presença da câmera com `ls /dev/video*` e teste o Kinect independentemente com `freenect-glview` antes de executar a PoC.
+Na inicialização, se o Kinect falhar, a PoC tenta webcam e em seguida `--fallback-video`, se informado. Durante a execução, `m` alterna entre as fontes configuradas. Se webcam e vídeo de fallback também falharem, a PoC informa os erros. Confirme a presença da câmera com `ls /dev/video*` e teste o Kinect independentemente com `freenect-glview`.
 
 Para um veredito objetivo sobre o Kinect, rode `python kinect_diagnostic.py [segundos]` (padrão: 15 s medidos após o primeiro frame). Ele lista os dispositivos USB com velocidade e controlador, captura profundidade/RGB com `runloop` em um subprocesso (que pode ser encerrado se travar) e informa o tempo até o primeiro frame, o FPS em regime estável, o maior intervalo entre frames e as perdas registradas pela libfreenect. Retorna `0` (OK), `1` (instável) ou `2` (falha). Se o veredito for instável, repita após trocar de porta ou cabo; o Kinect v1 às vezes é mais estável em portas EHCI (`ehci-pci` no `lsusb -t`) do que em xHCI (`xhci_hcd`), mas neste equipamento a captura foi estável em xHCI.
