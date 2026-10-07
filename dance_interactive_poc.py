@@ -41,6 +41,8 @@ DEFAULT_MAX_DEPTH_MM = 3000
 DEPTH_STEP_MM = 100
 BACKGROUND_SAMPLE_COUNT = 15
 BACKGROUND_DIFF_MM = 80
+YOLO_PT_MODEL = "yolov8n-pose.pt"
+YOLO_OPENVINO_MODEL = "yolov8n-pose_openvino_model"
 FrameData = tuple[np.ndarray, np.ndarray, np.ndarray]
 CaptureResult = tuple[
     bool,
@@ -468,6 +470,18 @@ class VisionResult:
     body_frame: np.ndarray
 
 
+def export_yolo_openvino_model(yolo_class=None) -> str:
+    if os.path.isdir(YOLO_OPENVINO_MODEL):
+        return YOLO_OPENVINO_MODEL
+    if yolo_class is None:
+        from ultralytics import YOLO as yolo_class
+    model = yolo_class(YOLO_PT_MODEL)
+    model.export(format="openvino", imgsz=320)
+    if not os.path.isdir(YOLO_OPENVINO_MODEL):
+        raise RuntimeError(f"A exportacao nao criou {YOLO_OPENVINO_MODEL}")
+    return YOLO_OPENVINO_MODEL
+
+
 class VisionProcessor:
     """Runs one selected 2D algorithm on each new RGB frame."""
 
@@ -485,7 +499,7 @@ class VisionProcessor:
     FLOW_SCALE = 0.125
     FLOW_THRESHOLD = 0.15
 
-    def __init__(self, mode: str) -> None:
+    def __init__(self, mode: str, nogpu: bool = False) -> None:
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Modo 2D desconhecido: {mode}")
         self.mode = mode
@@ -493,21 +507,67 @@ class VisionProcessor:
         self._mog2 = None
         self._previous_gray: Optional[np.ndarray] = None
         self._yolo = None
+        self._yolo_device: Optional[int | str] = None
+        self._yolo_backend: Optional[str] = None
         if mode == "mog2":
             self._reset_mog2()
         elif mode == "yolo":
-            try:
-                from ultralytics import YOLO
-            except ImportError as exc:
-                raise RuntimeError(
-                    "O modo YOLO requer ultralytics; instale com "
-                    "python -m pip install -r requirements.txt"
-                ) from exc
-            self._yolo = YOLO("yolov8n-pose.pt")
+            self._load_yolo(nogpu)
 
     @property
     def label(self) -> str:
+        if self.mode == "yolo" and self._yolo_backend:
+            return f"YOLOv8 Pose [{self._yolo_backend}]"
         return self.MODE_LABELS[self.mode]
+
+    def _load_yolo(self, nogpu: bool) -> None:
+        try:
+            import torch
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError(
+                "O modo YOLO requer ultralytics/PyTorch; instale com "
+                "python -m pip install -r requirements.txt"
+            ) from exc
+
+        cuda_available = bool(torch.cuda.is_available())
+        if cuda_available and not nogpu:
+            self._yolo = YOLO(YOLO_PT_MODEL)
+            self._yolo_device = 0
+            self._yolo_backend = "CUDA / NVIDIA GPU"
+            return
+
+        try:
+            import openvino  # noqa: F401
+        except ImportError:
+            self._load_yolo_cpu(YOLO, "OpenVINO ausente")
+            return
+
+        if not os.path.isdir(YOLO_OPENVINO_MODEL):
+            print(
+                f"Modelo OpenVINO ausente; exportando {YOLO_PT_MODEL} para CPU...",
+                flush=True,
+            )
+            try:
+                export_yolo_openvino_model(YOLO)
+            except Exception as exc:
+                self._load_yolo_cpu(YOLO, f"falha na exportacao OpenVINO: {exc}")
+                return
+
+        try:
+            self._yolo = YOLO(YOLO_OPENVINO_MODEL)
+            self._yolo_backend = "OpenVINO / CPU Intel"
+        except Exception as exc:
+            self._load_yolo_cpu(YOLO, f"falha ao carregar OpenVINO: {exc}")
+
+    def _load_yolo_cpu(self, yolo_class, reason: str) -> None:
+        print(
+            f"Aviso: {reason}; usando YOLO PyTorch em CPU.",
+            file=sys.stderr,
+        )
+        self._yolo = yolo_class(YOLO_PT_MODEL)
+        self._yolo_device = "cpu"
+        self._yolo_backend = "PyTorch CPU"
 
     def _reset_mog2(self) -> None:
         self._mog2 = cv2.createBackgroundSubtractorMOG2(
@@ -610,9 +670,16 @@ class VisionProcessor:
         return np.asarray(value)
 
     def _process_yolo(self, frame_bgr: np.ndarray) -> VisionResult:
-        predictions = self._yolo(frame_bgr, verbose=False, imgsz=320)
-        result = predictions[0]
         height, width = frame_bgr.shape[:2]
+        frame_320 = cv2.resize(frame_bgr, (320, 240), interpolation=cv2.INTER_AREA)
+        inference_options = {}
+        if self._yolo_device is not None:
+            inference_options["device"] = self._yolo_device
+        predictions = self._yolo(
+            frame_320, imgsz=320, verbose=False, **inference_options
+        )
+        result = predictions[0]
+        scale_x, scale_y = width / 320.0, height / 240.0
         mask = np.zeros((height, width), dtype=np.uint8)
         debug = frame_bgr.copy()
         keypoints = getattr(result, "keypoints", None)
@@ -623,7 +690,10 @@ class VisionProcessor:
 
         if boxes is not None:
             for box in boxes:
-                x1, y1, x2, y2 = np.rint(box[:4]).astype(int)
+                scaled_box = box[:4] * np.array(
+                    (scale_x, scale_y, scale_x, scale_y), dtype=np.float32
+                )
+                x1, y1, x2, y2 = np.rint(scaled_box).astype(int)
                 cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 200, 255), 2)
         if points_by_person is not None:
             for person_index, points in enumerate(points_by_person):
@@ -636,8 +706,9 @@ class VisionProcessor:
                 )
                 if confidence is not None and person_index < len(confidence):
                     valid &= confidence[person_index] >= 0.25
+                scaled_points = points * np.array((scale_x, scale_y), dtype=np.float32)
                 integer_points = np.rint(
-                    np.nan_to_num(points, nan=-1.0, posinf=-1.0, neginf=-1.0)
+                    np.nan_to_num(scaled_points, nan=-1.0, posinf=-1.0, neginf=-1.0)
                 ).astype(int)
                 for start, end in self.SKELETON_EDGES:
                     if valid[start] and valid[end]:
@@ -745,6 +816,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help="algoritmo 2D: kinect, mog2, optical_flow ou yolo (padrao: kinect para Kinect, mog2 para outras fontes)",
     )
+    parser.add_argument(
+        "--nogpu",
+        action="store_true",
+        help="forca YOLO em OpenVINO/CPU ou PyTorch CPU em vez de CUDA",
+    )
     parser.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH_MM, help="profundidade minima em mm (padrao: %(default)s)")
     parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH_MM, help="profundidade maxima em mm (padrao: %(default)s)")
     args = parser.parse_args(argv)
@@ -768,8 +844,8 @@ def resolve_active_mode(requested_mode: str, capturer: CaptureSource) -> str:
     return requested_mode
 
 
-def make_vision_processor(mode: str) -> Optional[VisionProcessor]:
-    return None if mode == "kinect" else VisionProcessor(mode)
+def make_vision_processor(mode: str, nogpu: bool = False) -> Optional[VisionProcessor]:
+    return None if mode == "kinect" else VisionProcessor(mode, nogpu=nogpu)
 
 
 def main() -> int:
@@ -783,7 +859,7 @@ def main() -> int:
         return 1
     active_mode = resolve_active_mode(args.mode, capturer)
     try:
-        processor = make_vision_processor(active_mode)
+        processor = make_vision_processor(active_mode, nogpu=args.nogpu)
     except Exception as exc:
         capturer.close()
         print(f"Erro ao iniciar modo {active_mode}: {exc}", file=sys.stderr)
@@ -921,7 +997,7 @@ def main() -> int:
                     previous_mode = active_mode
                     active_mode = resolve_active_mode(args.mode, capturer)
                     if active_mode != previous_mode:
-                        processor = make_vision_processor(active_mode)
+                        processor = make_vision_processor(active_mode, nogpu=args.nogpu)
                     elif processor is not None:
                         processor.reset()
                     recent_frame_times.clear()

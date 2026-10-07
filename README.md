@@ -63,6 +63,7 @@ Selecione o algoritmo de processamento para webcam ou vídeo:
 python dance_interactive_poc.py --source ensaio.mp4 --mode mog2
 python dance_interactive_poc.py --source ensaio.mp4 --mode optical_flow
 python dance_interactive_poc.py --source ensaio.mp4 --mode yolo
+python dance_interactive_poc.py --source ensaio.mp4 --mode yolo --nogpu
 python dance_interactive_poc.py --source kinect --mode kinect
 ```
 
@@ -71,6 +72,7 @@ Para fontes webcam/vídeo, o modo padrão é `mog2`. `--mode kinect` exige `--so
 - **MOG2:** `BackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)` roda em 160×120; a máscara é ampliada ao tamanho original, limpa com abertura/fechamento morfológicos e seu centroide vem dos momentos.
 - **Optical Flow:** Farneback roda em 80×60 entre frames cinza consecutivos; a máscara seleciona movimento acima de 0,15 px nessa escala (~1,2 px na imagem original) e a janela Corpo mostra vetores ampliados e recortados pela máscara.
 - **YOLO:** `yolov8n-pose.pt`, inferência em `imgsz=320`; keypoints COCO 17 desenham caixa e esqueleto. A máscara é uma aproximação espessa dos membros/articulações, não uma segmentação semântica do contorno real.
+- **YOLO sem GPU:** `--nogpu` prefere OpenVINO/CPU. Se `yolov8n-pose_openvino_model/` não existir, a PoC tenta exportar o `.pt` automaticamente. Se OpenVINO ou a exportação falharem, usa PyTorch CPU e avisa no terminal. Sem `--nogpu`, CUDA disponível tem prioridade.
 - **Kinect:** máscara RAW pela faixa de profundidade, com calibração de fundo opcional pela tecla `b`.
 
 As metas de latência (<8 ms MOG2, <5 ms Farneback, <20 ms YOLO) são metas por algoritmo, não garantias de latência ponta a ponta. A janela debug/projetores e o FPS de captura também consomem tempo; valide com `kinect_diagnostic.py`/telemetria no hardware final.
