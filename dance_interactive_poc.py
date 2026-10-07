@@ -297,6 +297,11 @@ def make_body_visual(mask: np.ndarray, elapsed: float) -> np.ndarray:
     return cv2.bitwise_and(pattern, pattern, mask=mask)
 
 
+def make_composite_preview(floor: np.ndarray, body: np.ndarray) -> np.ndarray:
+    # Soma saturada: dois projetores sobrepostos somam luz, nao se substituem.
+    return cv2.add(floor, body)
+
+
 def draw_debug_overlay(
     debug: np.ndarray,
     source: str,
@@ -336,10 +341,12 @@ def main() -> int:
         "Debug & Tracking",
         "Projetor 1 - Chao/Fundo",
         "Projetor 2 - Corpo/Frontal",
+        "Simulacao - Chao + Corpo",
     )
     cv2.namedWindow(windows[0], cv2.WINDOW_NORMAL)
     cv2.namedWindow(windows[1], cv2.WINDOW_NORMAL)
     cv2.namedWindow(windows[2], cv2.WINDOW_NORMAL)
+    cv2.namedWindow(windows[3], cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(windows[1], cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     cv2.setWindowProperty(windows[2], cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -388,10 +395,12 @@ def main() -> int:
             draw_debug_overlay(debug, source, fps, last_latency_ms, depth_range)
             floor = make_floor_visual(body_mask, elapsed, phase)
             body = make_body_visual(body_mask, elapsed)
+            composite = make_composite_preview(floor, body)
 
             cv2.imshow(windows[0], debug)
             cv2.imshow(windows[1], floor)
             cv2.imshow(windows[2], body)
+            cv2.imshow(windows[3], composite)
             key = cv2.waitKey(1) & 0xFF
             last_latency_ms = (time.perf_counter() - frame_start) * 1000.0
             recent_latency.append(last_latency_ms)
