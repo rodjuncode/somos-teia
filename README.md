@@ -10,7 +10,7 @@ O protótipo em [`dance_interactive_poc.py`](dance_interactive_poc.py) já imple
 - Três fontes intercambiáveis pela CLI e pela tecla `m`: Kinect v1, webcam USB e arquivo MP4/MOV em loop.
 - Fallback automático de Kinect para webcam e, opcionalmente, arquivo de vídeo.
 - Saída padronizada de todos os capturadores: sucesso, frame RGB, profundidade real ou matriz dummy e máscara corporal.
-- Webcam e vídeo usam MediaPipe Selfie Segmentation; o cálculo de Pose está temporariamente desativado para reduzir latência.
+- Webcam e vídeo usam apenas MediaPipe Pose neste modo de teste; a máscara corporal fica zerada e a segmentação está desativada.
 - Máscara binária por faixa de profundidade no Kinect, configurada inicialmente entre 800 e 3000 mm (ajustável por linha de comando e por atalhos).
 - Overlay de máscara/contornos ou landmarks, FPS, faixa de profundidade e latência estimada.
 - Quatro janelas OpenCV: debug, visual de chão, silhueta vermelha recortada e uma simulação com os projetores sobrepostos.
@@ -72,19 +72,19 @@ No Kinect, os atalhos alteram a faixa em passos de 100 mm:
 | `x` | Aumenta o limite máximo |
 | `b` | Captura/recria o fundo; faça isso com a área de dança vazia |
 
-Esses ajustes só se aplicam ao Kinect. No fallback, a máscara vem da segmentação do MediaPipe; o mapa de profundidade é preenchido com zeros.
+Esses ajustes só se aplicam ao Kinect. No modo webcam/vídeo Pose-only, `body_mask` e o mapa de profundidade são matrizes zeradas; landmarks aparecem no Debug e as janelas de corpo/chão não recebem silhueta.
 
 **Calibração do fundo:** ao pressionar `b`, a PoC registra a mediana de 15 frames (cerca de 0,5 s) como fundo estático. A máscara passa a incluir somente pixels dentro de `Min Depth`–`Max Depth` que estejam pelo menos 80 mm mais próximos que o fundo capturado. A parede fica fora da máscara e o dançarino, entre a câmera e a parede, aparece. O overlay mostra `Fundo: calibrado` quando ativo. Faça a captura sem pessoas na área e repita se mover a câmera, a parede ou objetos grandes; se o dançarino estiver presente durante a calibração, ele será tratado como fundo e sumirá da máscara.
 
 Sem calibrar o fundo, a máscara continua sendo apenas um corte por distância e **tudo** dentro da faixa aparece, incluindo parede, chão e móveis. O mapa usa `0` para "sem leitura"; nesta unidade, leituras válidas foram observadas desde ~410 mm. A "sombra" junto ao corpo vem da oclusão do padrão infravermelho do Kinect; pixels sem leitura continuam fora da máscara. A diferença de 80 mm pode ser insuficiente para superfícies que se moveram pouco, ou excessiva para partes muito finas do corpo; os limites Min/Max continuam sendo aplicados.
 
-Todos os capturadores entregam ao loop principal `(success, frame_rgb, depth_or_dummy, body_mask)`. Webcam e vídeo preenchem `depth_or_dummy` com zeros. `Ctrl+C` também solicita o encerramento.
+Todos os capturadores entregam ao loop principal `(success, frame_rgb, depth_or_dummy, body_mask)`. Webcam e vídeo preenchem `depth_or_dummy` e `body_mask` com zeros neste modo de teste. `Ctrl+C` também solicita o encerramento.
 
 ## Janelas e telemetria
 
-- **Debug & Tracking:** vídeo com máscara/contorno, FPS, latência, limites do sensor e fonte ativa. Pose está desativado nos modos webcam e vídeo.
+- **Debug & Tracking:** vídeo RGB com esqueleto Pose, FPS, latência, limites do sensor e fonte ativa. Webcam e vídeo não calculam máscara.
 - **Projetor 1 - Chão/Fundo:** ondas e círculos guiados pelo centro de massa da máscara.
-- **Projetor 2 - Corpo/Frontal:** vermelho sólido aplicado apenas dentro da máscara binária.
+- **Projetor 2 - Corpo/Frontal:** vermelho sólido aplicado dentro da máscara Kinect; fica vazio com webcam/vídeo em modo Pose-only.
 - **Simulação - Chão + Corpo:** pré-visualização de como os dois projetores ficam sobrepostos. As imagens são somadas (com saturação em 255), como a luz de dois projetores; fora da silhueta aparece só o chão. É uma janela comum, não em tela cheia, e não depende de um segundo monitor.
 
 A latência exibida é medida por `time.perf_counter()` desde o timestamp associado ao frame até o fim do ciclo de exibição/`waitKey`. É uma estimativa de software; não mede exposição do sensor, sincronização real dos projetores ou o tempo até o conteúdo aparecer fisicamente. Os timestamps de Kinect e webcam também não são equivalentes, portanto os resultados entre modos não devem ser comparados como uma medição calibrada.
