@@ -10,12 +10,14 @@ Instalacao no Ubuntu (para Kinect, instale primeiro as libs nativas):
     python -m pip install -r requirements-kinect.txt
 
 Execute com `python dance_interactive_poc.py`. Pressione q para sair.
-Atalhos Kinect: a/z diminuem/aumentam Min Depth; s/x diminuem/aumentam
-Max Depth. O modo Kinect usa profundidade em milimetros (DEPTH_MM).
+Faixa inicial: --min-depth/--max-depth (mm). Atalhos Kinect: a/z diminuem/aumentam
+Min Depth; s/x diminuem/aumentam Max Depth, em passos de 100 mm.
+O modo Kinect usa profundidade em milimetros (DEPTH_MM).
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 import threading
 import time
@@ -27,6 +29,10 @@ import numpy as np
 
 # Medido: o 1o frame do Kinect v1 chega em ~7 s neste equipamento.
 KINECT_START_TIMEOUT = 20.0
+# O Kinect v1 so mede a partir de ~800 mm; 0 significa "sem leitura".
+DEFAULT_MIN_DEPTH_MM = 800
+DEFAULT_MAX_DEPTH_MM = 3000
+DEPTH_STEP_MM = 100
 
 
 class KinectCaptureShutdownError(RuntimeError):
@@ -36,7 +42,11 @@ class KinectCaptureShutdownError(RuntimeError):
 class KinectV1Capturer:
     """Le RGB e profundidade em uma thread e publica somente o frame mais novo."""
 
-    def __init__(self, min_depth: int = 500, max_depth: int = 950) -> None:
+    def __init__(
+        self,
+        min_depth: int = DEFAULT_MIN_DEPTH_MM,
+        max_depth: int = DEFAULT_MAX_DEPTH_MM,
+    ) -> None:
         import freenect
 
         self._freenect = freenect
@@ -124,7 +134,7 @@ class KinectV1Capturer:
 
     def adjust_depth(self, min_delta: int = 0, max_delta: int = 0) -> None:
         with self._lock:
-            self._min_depth = max(0, min(10000, self._min_depth + min_delta))
+            self._min_depth = max(1, min(10000, self._min_depth + min_delta))
             self._max_depth = max(self._min_depth + 1, self._max_depth + max_delta)
 
     @property
@@ -237,9 +247,9 @@ class WebcamCapturer:
             raise RuntimeError("A thread da webcam nao encerrou em 3 segundos")
 
 
-def create_capturer():
+def create_capturer(min_depth: int = DEFAULT_MIN_DEPTH_MM, max_depth: int = DEFAULT_MAX_DEPTH_MM):
     try:
-        capturer = KinectV1Capturer()
+        capturer = KinectV1Capturer(min_depth, max_depth)
         print("Kinect v1 detectado; usando profundidade em milimetros.")
         return capturer, "Kinect v1"
     except Exception as exc:
@@ -331,9 +341,20 @@ def draw_debug_overlay(
         )
 
 
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="PoC de danca interativa com Kinect v1 ou webcam.")
+    parser.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH_MM, help="profundidade minima em mm (padrao: %(default)s)")
+    parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH_MM, help="profundidade maxima em mm (padrao: %(default)s)")
+    args = parser.parse_args(argv)
+    if not 1 <= args.min_depth < args.max_depth:
+        parser.error("--min-depth deve ser >= 1 e menor que --max-depth")
+    return args
+
+
 def main() -> int:
+    args = parse_args()
     try:
-        capturer, source = create_capturer()
+        capturer, source = create_capturer(args.min_depth, args.max_depth)
     except RuntimeError as exc:
         print(f"Erro ao iniciar captura: {exc}", file=sys.stderr)
         return 1
@@ -409,13 +430,13 @@ def main() -> int:
                 break
             if source == "Kinect v1":
                 if key == ord("a"):
-                    capturer.adjust_depth(min_delta=-25)
+                    capturer.adjust_depth(min_delta=-DEPTH_STEP_MM)
                 elif key == ord("z"):
-                    capturer.adjust_depth(min_delta=25)
+                    capturer.adjust_depth(min_delta=DEPTH_STEP_MM)
                 elif key == ord("s"):
-                    capturer.adjust_depth(max_delta=-25)
+                    capturer.adjust_depth(max_delta=-DEPTH_STEP_MM)
                 elif key == ord("x"):
-                    capturer.adjust_depth(max_delta=25)
+                    capturer.adjust_depth(max_delta=DEPTH_STEP_MM)
     except KeyboardInterrupt:
         print("\nInterrompido pelo usuario; encerrando captura...", file=sys.stderr)
     finally:
