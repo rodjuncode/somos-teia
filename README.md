@@ -10,13 +10,14 @@ O protótipo em [`dance_interactive_poc.py`](dance_interactive_poc.py) já imple
 - Três fontes intercambiáveis pela CLI e pela tecla `m`: Kinect v1, webcam USB e arquivo MP4/MOV em loop.
 - Fallback automático de Kinect para webcam e, opcionalmente, arquivo de vídeo.
 - Saída padronizada de todos os capturadores: sucesso, frame RGB, profundidade real ou matriz dummy e máscara corporal.
-- Webcam e vídeo usam apenas MediaPipe Pose neste modo de teste; a máscara corporal fica zerada e a segmentação está desativada.
+- Webcam e vídeo usam modos selecionáveis: MOG2, fluxo óptico Farneback ou YOLOv8n-pose. O padrão é MOG2, sem inferência de IA.
+- Modo Kinect mantém profundidade RAW; se a inicialização falhar, o fallback usa MOG2 na webcam/vídeo.
 - Máscara binária por faixa de profundidade no Kinect, configurada inicialmente entre 800 e 3000 mm (ajustável por linha de comando e por atalhos).
-- Overlay de máscara/contornos ou landmarks, FPS, faixa de profundidade e latência estimada.
+- Overlay de máscara/contornos, vetores ópticos ou esqueleto YOLO, FPS, modo ativo e latência estimada.
 - Quatro janelas OpenCV: debug, visual de chão, silhueta vermelha recortada e uma simulação com os projetores sobrepostos.
 - Encerramento de captura e janelas ao pressionar `q`.
 
-O script passou por compilação sintática no ambiente virtual. Ainda não houve validação com Kinect, webcam, projetores ou medição física de latência. O alvo de menos de 35 ms é um objetivo de desenvolvimento, não uma garantia da PoC.
+O código compila e MOG2, Farneback e YOLO foram verificados com quadros sintéticos; YOLO real/model weights e execução ponta a ponta nos projetores ainda não foram validados nesta revisão. As metas de latência são objetivos por algoritmo, não garantias ponta a ponta.
 
 ## Requisitos
 
@@ -24,7 +25,7 @@ O script passou por compilação sintática no ambiente virtual. Ainda não houv
 - Para Kinect v1: dispositivo conectado, bibliotecas de desenvolvimento `libfreenect` e binding Python `freenect`.
 - Para webcam/fallback: câmera acessível e dependências Python do [`requirements.txt`](requirements.txt).
 
-O Kinect requer a biblioteca nativa `libfreenect` e headers de desenvolvimento; a binding Python e as demais dependências ficam isoladas no venv. O pacote `python3-freenect` não é usado.
+O Kinect requer a biblioteca nativa `libfreenect` e headers de desenvolvimento; a binding Python e as demais dependências ficam isoladas no venv. O pacote `python3-freenect` não é usado. Ultralytics/PyTorch adiciona dependências grandes e baixa `yolov8n-pose.pt` ao primeiro uso do modo YOLO.
 
 ```bash
 sudo apt-get update
@@ -35,7 +36,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements-kinect.txt
 ```
 
-O comando pip instala tudo dentro do venv. As versões de NumPy, OpenCV e MediaPipe estão alinhadas: a PoC usa a API `mp.solutions` de MediaPipe 0.10.21; a série 1.x remove essa API legada. Os mesmos pacotes estão listados em [`requirements-kinect.txt`](requirements-kinect.txt); para usar somente webcam ou vídeo, sem Kinect, basta `python -m pip install -r requirements.txt`.
+O comando pip instala as dependências de visão dentro do venv. Os pacotes estão listados em [`requirements.txt`](requirements.txt); `requirements-kinect.txt` também instala a binding `freenect` e Cython. Para YOLO, use `--mode yolo`; MOG2 e Farneback não precisam de rede neural.
 
 Para conferir a binding antes de conectar a câmera, execute `python -c "import freenect; print('freenect importado')"` dentro do venv. A disponibilidade do dispositivo e as permissões USB ainda precisam ser verificadas no hardware usado.
 
@@ -56,6 +57,24 @@ python dance_interactive_poc.py --source ensaio.mp4
 python dance_interactive_poc.py --source kinect --fallback-video ensaio.mp4
 ```
 
+Selecione o algoritmo de processamento para webcam ou vídeo:
+
+```bash
+python dance_interactive_poc.py --source ensaio.mp4 --mode mog2
+python dance_interactive_poc.py --source ensaio.mp4 --mode optical_flow
+python dance_interactive_poc.py --source ensaio.mp4 --mode yolo
+python dance_interactive_poc.py --source kinect --mode kinect
+```
+
+Para fontes webcam/vídeo, o modo padrão é `mog2`. `--mode kinect` exige `--source kinect`; os outros modos podem processar RGB de webcam, vídeo ou Kinect. `m` continua alternando as fontes disponíveis sem reiniciar e reseta o estado temporal do algoritmo quando necessário.
+
+- **MOG2:** `BackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)` roda em 160×120; a máscara é ampliada ao tamanho original, limpa com abertura/fechamento morfológicos e seu centroide vem dos momentos.
+- **Optical Flow:** Farneback roda em 80×60 entre frames cinza consecutivos; a máscara seleciona movimento acima de 0,15 px nessa escala (~1,2 px na imagem original) e a janela Corpo mostra vetores ampliados e recortados pela máscara.
+- **YOLO:** `yolov8n-pose.pt`, inferência em `imgsz=320`; keypoints COCO 17 desenham caixa e esqueleto. A máscara é uma aproximação espessa dos membros/articulações, não uma segmentação semântica do contorno real.
+- **Kinect:** máscara RAW pela faixa de profundidade, com calibração de fundo opcional pela tecla `b`.
+
+As metas de latência (<8 ms MOG2, <5 ms Farneback, <20 ms YOLO) são metas por algoritmo, não garantias de latência ponta a ponta. A janela debug/projetores e o FPS de captura também consomem tempo; valide com `kinect_diagnostic.py`/telemetria no hardware final.
+
 MP4, MOV e M4V são reproduzidos em loop. Pressione `m` para alternar, sem fechar o programa, entre Kinect, webcam e o vídeo configurado (por `--source` ou `--fallback-video`). Se o Kinect selecionado não iniciar, a aplicação tenta webcam e depois o vídeo informado em `--fallback-video`. Pressione `q` para sair. Para remover paredes e outros objetos estáticos da máscara no Kinect, deixe a cena vazia e pressione `b` na janela de debug. A faixa inicial de profundidade vem de `--min-depth` e `--max-depth`, em mm (padrão: 800 a 3000):
 
 ```bash
@@ -72,19 +91,19 @@ No Kinect, os atalhos alteram a faixa em passos de 100 mm:
 | `x` | Aumenta o limite máximo |
 | `b` | Captura/recria o fundo; faça isso com a área de dança vazia |
 
-Esses ajustes só se aplicam ao Kinect. No modo webcam/vídeo Pose-only, `body_mask` e o mapa de profundidade são matrizes zeradas; landmarks aparecem no Debug e as janelas de corpo/chão não recebem silhueta.
+Esses ajustes só se aplicam ao Kinect. Em webcam/vídeo, o mapa de profundidade é uma matriz zerada e o algoritmo escolhido produz `body_mask`.
 
-**Calibração do fundo:** ao pressionar `b`, a PoC registra a mediana de 15 frames (cerca de 0,5 s) como fundo estático. A máscara passa a incluir somente pixels dentro de `Min Depth`–`Max Depth` que estejam pelo menos 80 mm mais próximos que o fundo capturado. A parede fica fora da máscara e o dançarino, entre a câmera e a parede, aparece. O overlay mostra `Fundo: calibrado` quando ativo. Faça a captura sem pessoas na área e repita se mover a câmera, a parede ou objetos grandes; se o dançarino estiver presente durante a calibração, ele será tratado como fundo e sumirá da máscara.
+**Calibração do fundo Kinect:** ao pressionar `b`, a PoC registra a mediana de 15 frames (cerca de 0,5 s) como fundo estático. A máscara passa a incluir somente pixels dentro de `Min Depth`–`Max Depth` que estejam pelo menos 80 mm mais próximos que o fundo capturado. A parede fica fora da máscara e o dançarino, entre a câmera e a parede, aparece. O overlay mostra `Fundo: calibrado` quando ativo. Faça a captura sem pessoas na área e repita se mover a câmera, a parede ou objetos grandes; se o dançarino estiver presente durante a calibração, ele será tratado como fundo e sumirá da máscara.
 
 Sem calibrar o fundo, a máscara continua sendo apenas um corte por distância e **tudo** dentro da faixa aparece, incluindo parede, chão e móveis. O mapa usa `0` para "sem leitura"; nesta unidade, leituras válidas foram observadas desde ~410 mm. A "sombra" junto ao corpo vem da oclusão do padrão infravermelho do Kinect; pixels sem leitura continuam fora da máscara. A diferença de 80 mm pode ser insuficiente para superfícies que se moveram pouco, ou excessiva para partes muito finas do corpo; os limites Min/Max continuam sendo aplicados.
 
-Todos os capturadores entregam ao loop principal `(success, frame_rgb, depth_or_dummy, body_mask)`. Webcam e vídeo preenchem `depth_or_dummy` e `body_mask` com zeros neste modo de teste. `Ctrl+C` também solicita o encerramento.
+Todos os capturadores entregam ao loop principal `(success, frame_rgb, depth_or_dummy, body_mask)`. Webcam e vídeo preenchem `depth_or_dummy` com zeros; o algoritmo selecionado produz a máscara. `Ctrl+C` também solicita o encerramento.
 
 ## Janelas e telemetria
 
-- **Debug & Tracking:** vídeo RGB com esqueleto Pose, FPS, latência, limites do sensor e fonte ativa. Webcam e vídeo não calculam máscara.
+- **Debug & Tracking:** vídeo da fonte com máscara, vetores ou caixa/esqueleto conforme o algoritmo, FPS, latência, modo e fonte ativos.
 - **Projetor 1 - Chão/Fundo:** ondas e círculos guiados pelo centro de massa da máscara.
-- **Projetor 2 - Corpo/Frontal:** vermelho sólido aplicado dentro da máscara Kinect; fica vazio com webcam/vídeo em modo Pose-only.
+- **Projetor 2 - Corpo/Frontal:** padrão vermelho sólido recortado pela máscara produzida pelo algoritmo ativo.
 - **Simulação - Chão + Corpo:** pré-visualização de como os dois projetores ficam sobrepostos. As imagens são somadas (com saturação em 255), como a luz de dois projetores; fora da silhueta aparece só o chão. É uma janela comum, não em tela cheia, e não depende de um segundo monitor.
 
 A latência exibida é medida por `time.perf_counter()` desde o timestamp associado ao frame até o fim do ciclo de exibição/`waitKey`. É uma estimativa de software; não mede exposição do sensor, sincronização real dos projetores ou o tempo até o conteúdo aparecer fisicamente. Os timestamps de Kinect e webcam também não são equivalentes, portanto os resultados entre modos não devem ser comparados como uma medição calibrada.
@@ -115,7 +134,7 @@ Exemplo: `feat(projection): add floor and body composite preview`. Enquanto a ve
 ## Limitações conhecidas
 
 - OpenCV pode abrir as duas janelas de projetor em tela cheia no mesmo monitor; a disposição depende do sistema de janelas e ainda não há calibração de projetores.
-- A segmentação MediaPipe e os drivers Kinect não foram validados neste ambiente.
+- A medição por modo depende da câmera, resolução, CPU/GPU e backend de exibição; as metas de latência ainda precisam ser medidas no hardware de apresentação.
 - A combinação de sistema operacional, driver, câmera, resolução e projetor determina a latência real.
 
 ### Kinect: avisos USB e áudio
