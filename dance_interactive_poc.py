@@ -470,6 +470,31 @@ class VisionResult:
     body_frame: np.ndarray
 
 
+class PointSmoother:
+    def __init__(self, alpha: float = 0.2) -> None:
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError("alpha deve estar no intervalo (0, 1]")
+        self.alpha = alpha
+        self._points: dict[tuple[int, int], np.ndarray] = {}
+
+    def reset(self) -> None:
+        self._points.clear()
+
+    def update(
+        self, points: dict[tuple[int, int], tuple[float, float]]
+    ) -> dict[tuple[int, int], tuple[float, float]]:
+        smoothed_points = {}
+        next_points = {}
+        for key, raw_position in points.items():
+            raw = np.asarray(raw_position, dtype=np.float32)
+            previous = self._points.get(key)
+            value = raw if previous is None else previous + self.alpha * (raw - previous)
+            next_points[key] = value
+            smoothed_points[key] = (float(value[0]), float(value[1]))
+        self._points = next_points
+        return smoothed_points
+
+
 def export_yolo_openvino_model(yolo_class=None) -> str:
     if os.path.isdir(YOLO_OPENVINO_MODEL):
         return YOLO_OPENVINO_MODEL
@@ -490,19 +515,25 @@ class VisionProcessor:
         "optical_flow": "Optical Flow (Farneback)",
         "yolo": "YOLOv8n-pose",
     }
-    SKELETON_EDGES = (
-        (5, 7), (7, 9), (6, 8), (8, 10), (5, 6),
-        (5, 11), (6, 12), (11, 12),
-        (11, 13), (13, 15), (12, 14), (14, 16),
-    )
+    FACE_KEYPOINTS = (0, 1, 2, 3, 4)
     MOG2_SCALE = 0.25
     FLOW_SCALE = 0.125
     FLOW_THRESHOLD = 0.15
 
-    def __init__(self, mode: str, nogpu: bool = False) -> None:
+    def __init__(
+        self,
+        mode: str,
+        nogpu: bool = False,
+        alpha: float = 0.2,
+        max_distance: float = 150.0,
+    ) -> None:
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Modo 2D desconhecido: {mode}")
+        if max_distance <= 0:
+            raise ValueError("max_distance deve ser maior que zero")
         self.mode = mode
+        self.max_distance = max_distance
+        self._point_smoother = PointSmoother(alpha)
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._mog2 = None
         self._previous_gray: Optional[np.ndarray] = None
@@ -579,6 +610,8 @@ class VisionProcessor:
             self._reset_mog2()
         elif self.mode == "optical_flow":
             self._previous_gray = None
+        elif self.mode == "yolo":
+            self._point_smoother.reset()
 
     def _clean_mask(self, mask: np.ndarray) -> np.ndarray:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)
@@ -680,23 +713,13 @@ class VisionProcessor:
         )
         result = predictions[0]
         scale_x, scale_y = width / 320.0, height / 240.0
-        mask = np.zeros((height, width), dtype=np.uint8)
-        debug = frame_bgr.copy()
         keypoints = getattr(result, "keypoints", None)
         points_by_person = self._to_numpy(getattr(keypoints, "xy", None))
         confidence = self._to_numpy(getattr(keypoints, "conf", None))
-        boxes = self._to_numpy(getattr(getattr(result, "boxes", None), "xyxy", None))
-        body = np.zeros_like(frame_bgr)
-
-        if boxes is not None:
-            for box in boxes:
-                scaled_box = box[:4] * np.array(
-                    (scale_x, scale_y, scale_x, scale_y), dtype=np.float32
-                )
-                x1, y1, x2, y2 = np.rint(scaled_box).astype(int)
-                cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 200, 255), 2)
+        raw_nodes: dict[tuple[int, int], tuple[float, float]] = {}
         if points_by_person is not None:
             for person_index, points in enumerate(points_by_person):
+                points = points * np.array((scale_x, scale_y), dtype=np.float32)
                 valid = (
                     np.isfinite(points).all(axis=1)
                     & (points[:, 0] >= 0)
@@ -706,42 +729,60 @@ class VisionProcessor:
                 )
                 if confidence is not None and person_index < len(confidence):
                     valid &= confidence[person_index] >= 0.25
-                scaled_points = points * np.array((scale_x, scale_y), dtype=np.float32)
-                integer_points = np.rint(
-                    np.nan_to_num(scaled_points, nan=-1.0, posinf=-1.0, neginf=-1.0)
-                ).astype(int)
-                for start, end in self.SKELETON_EDGES:
-                    if valid[start] and valid[end]:
-                        p1 = tuple(integer_points[start])
-                        p2 = tuple(integer_points[end])
-                        cv2.line(mask, p1, p2, 255, 24, cv2.LINE_AA)
-                        cv2.line(debug, p1, p2, (0, 0, 255), 1, cv2.LINE_AA)
-                        cv2.line(body, p1, p2, (0, 0, 255), 1, cv2.LINE_AA)
-                for point_index in range(5, len(integer_points)):
-                    point = integer_points[point_index]
-                    if valid[point_index]:
-                        p = tuple(point)
-                        cv2.circle(mask, p, 12, 255, -1, cv2.LINE_AA)
-                        cv2.circle(debug, p, 4, (0, 255, 0), -1, cv2.LINE_AA)
-                        cv2.circle(body, p, 4, (0, 255, 0), -1, cv2.LINE_AA)
+                visible_face = points[: len(self.FACE_KEYPOINTS)][
+                    valid[: len(self.FACE_KEYPOINTS)]
+                ]
+                if len(visible_face):
+                    head = visible_face.mean(axis=0)
+                    raw_nodes[(person_index, 17)] = (float(head[0]), float(head[1]))
+                for joint_index in range(5, min(17, len(points))):
+                    if valid[joint_index]:
+                        point = points[joint_index]
+                        raw_nodes[(person_index, joint_index)] = (
+                            float(point[0]), float(point[1])
+                        )
 
-                visible_head = integer_points[:5][valid[:5]]
-                if len(visible_head):
-                    head_center_array = np.rint(visible_head.mean(axis=0)).astype(int)
-                    head_center = tuple(head_center_array)
-                    radius = max(
-                        8,
-                        int(
-                            np.linalg.norm(visible_head - head_center_array, axis=1).max()
-                            + 5
-                        ),
-                    )
-                    cv2.circle(mask, head_center, radius, 255, 1, cv2.LINE_AA)
-                    cv2.circle(debug, head_center, radius, (0, 0, 255), 1, cv2.LINE_AA)
-                    cv2.circle(body, head_center, radius, (0, 0, 255), 1, cv2.LINE_AA)
+        smoothed = self._point_smoother.update(raw_nodes)
+        debug = frame_bgr.copy()
+        body = np.zeros_like(frame_bgr)
+        mask = np.zeros((height, width), dtype=np.uint8)
+        nodes = list(smoothed.items())
+        if nodes:
+            coordinates = np.asarray([position for _, position in nodes], dtype=np.float32)
+            offsets = coordinates[:, None, :] - coordinates[None, :, :]
+            distances = np.sqrt(np.sum(offsets * offsets, axis=2))
+            first, second = np.triu_indices(len(nodes), k=1)
+            connected = distances[first, second] < self.max_distance
+            first, second = first[connected], second[connected]
+            edge_distances = distances[first, second]
+
+            for node_a, node_b, distance in zip(first, second, edge_distances):
+                line_alpha = 1.0 - float(distance) / self.max_distance
+                color_value = int(255 * line_alpha)
+                line_color = (
+                    color_value,
+                    int(color_value * 0.78),
+                    int(color_value * 0.45),
+                )
+                thickness = 1 + int(line_alpha * 2)
+                point_a = tuple(np.rint(coordinates[node_a]).astype(int))
+                point_b = tuple(np.rint(coordinates[node_b]).astype(int))
+                cv2.line(debug, point_a, point_b, line_color, thickness, cv2.LINE_AA)
+                cv2.line(body, point_a, point_b, line_color, thickness, cv2.LINE_AA)
+                cv2.line(mask, point_a, point_b, 255, 2, cv2.LINE_AA)
+
+            for node_key, position in nodes:
+                point = tuple(np.rint(position).astype(int))
+                is_head = node_key[1] == 17
+                radius = 7 if is_head else 5
+                cv2.circle(debug, point, radius + 3, (0, 55, 0), -1, cv2.LINE_AA)
+                cv2.circle(body, point, radius + 3, (0, 55, 0), -1, cv2.LINE_AA)
+                cv2.circle(debug, point, radius, (0, 255, 0), -1, cv2.LINE_AA)
+                cv2.circle(body, point, radius, (0, 255, 0), -1, cv2.LINE_AA)
+                cv2.circle(mask, point, radius + 3, 255, -1, cv2.LINE_AA)
 
         mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)[1]
-        return VisionResult(mask, debug, cv2.bitwise_and(body, body, mask=mask))
+        return VisionResult(mask, debug, body)
 
 
 def latency_color(latency_ms: float) -> tuple[int, int, int]:
@@ -821,6 +862,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="forca YOLO em OpenVINO/CPU ou PyTorch CPU em vez de CUDA",
     )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.2,
+        help="suavizacao EMA dos nos YOLO (padrao: 0.2)",
+    )
+    parser.add_argument(
+        "--max-distance",
+        type=float,
+        default=150.0,
+        help="distancia maxima de conexao entre nos YOLO, em pixels (padrao: 150)",
+    )
     parser.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH_MM, help="profundidade minima em mm (padrao: %(default)s)")
     parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH_MM, help="profundidade maxima em mm (padrao: %(default)s)")
     args = parser.parse_args(argv)
@@ -834,6 +887,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         args.mode = "kinect" if args.source == "kinect" else "mog2"
     if args.mode == "kinect" and args.source != "kinect":
         parser.error("--mode kinect requer --source kinect")
+    if not 0.0 < args.alpha <= 1.0:
+        parser.error("--alpha deve estar no intervalo (0, 1]")
+    if args.max_distance <= 0:
+        parser.error("--max-distance deve ser maior que zero")
     return args
 
 
@@ -844,8 +901,19 @@ def resolve_active_mode(requested_mode: str, capturer: CaptureSource) -> str:
     return requested_mode
 
 
-def make_vision_processor(mode: str, nogpu: bool = False) -> Optional[VisionProcessor]:
-    return None if mode == "kinect" else VisionProcessor(mode, nogpu=nogpu)
+def make_vision_processor(
+    mode: str,
+    nogpu: bool = False,
+    alpha: float = 0.2,
+    max_distance: float = 150.0,
+) -> Optional[VisionProcessor]:
+    return (
+        None
+        if mode == "kinect"
+        else VisionProcessor(
+            mode, nogpu=nogpu, alpha=alpha, max_distance=max_distance
+        )
+    )
 
 
 def main() -> int:
@@ -859,7 +927,9 @@ def main() -> int:
         return 1
     active_mode = resolve_active_mode(args.mode, capturer)
     try:
-        processor = make_vision_processor(active_mode, nogpu=args.nogpu)
+        processor = make_vision_processor(
+            active_mode, nogpu=args.nogpu, alpha=args.alpha, max_distance=args.max_distance
+        )
     except Exception as exc:
         capturer.close()
         print(f"Erro ao iniciar modo {active_mode}: {exc}", file=sys.stderr)
@@ -997,7 +1067,12 @@ def main() -> int:
                     previous_mode = active_mode
                     active_mode = resolve_active_mode(args.mode, capturer)
                     if active_mode != previous_mode:
-                        processor = make_vision_processor(active_mode, nogpu=args.nogpu)
+                        processor = make_vision_processor(
+                            active_mode,
+                            nogpu=args.nogpu,
+                            alpha=args.alpha,
+                            max_distance=args.max_distance,
+                        )
                     elif processor is not None:
                         processor.reset()
                     recent_frame_times.clear()

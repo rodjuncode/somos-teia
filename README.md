@@ -64,6 +64,7 @@ python dance_interactive_poc.py --source ensaio.mp4 --mode mog2
 python dance_interactive_poc.py --source ensaio.mp4 --mode optical_flow
 python dance_interactive_poc.py --source ensaio.mp4 --mode yolo
 python dance_interactive_poc.py --source ensaio.mp4 --mode yolo --nogpu
+python dance_interactive_poc.py --source ensaio.mp4 --mode yolo --alpha 0.2 --max-distance 150
 python dance_interactive_poc.py --source kinect --mode kinect
 ```
 
@@ -71,7 +72,7 @@ Para fontes webcam/vídeo, o modo padrão é `mog2`. `--mode kinect` exige `--so
 
 - **MOG2:** `BackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)` roda em 160×120; a máscara é ampliada ao tamanho original, limpa com abertura/fechamento morfológicos e seu centroide vem dos momentos.
 - **Optical Flow:** Farneback roda em 80×60 entre frames cinza consecutivos; a máscara seleciona movimento acima de 0,15 px nessa escala (~1,2 px na imagem original) e a janela Corpo mostra vetores ampliados e recortados pela máscara.
-- **YOLO:** `yolov8n-pose.pt`, inferência em `imgsz=320`; keypoints COCO 17 desenham caixa e esqueleto. A máscara é uma aproximação espessa dos membros/articulações, não uma segmentação semântica do contorno real.
+- **YOLO:** `yolov8n-pose.pt`, inferência em `imgsz=320`; a cabeça é a média simples do nariz, olhos e orelhas, junto aos nós de ombros, cotovelos, pulsos, quadris, joelhos e tornozelos. Uma EMA (`--alpha`, padrão 0,2) suaviza cada coordenada. A malha vetorizada liga todos os pares intra/interpessoais dentro de `--max-distance` (padrão 150 px); brilho e espessura variam com a proximidade. Os segmentos rígidos do esqueleto YOLO são ignorados.
 - **YOLO sem GPU:** `--nogpu` prefere OpenVINO/CPU. Se `yolov8n-pose_openvino_model/` não existir, a PoC tenta exportar o `.pt` automaticamente. Se OpenVINO ou a exportação falharem, usa PyTorch CPU e avisa no terminal. Sem `--nogpu`, CUDA disponível tem prioridade.
 - **Kinect:** máscara RAW pela faixa de profundidade, com calibração de fundo opcional pela tecla `b`.
 
@@ -104,7 +105,7 @@ Todos os capturadores entregam ao loop principal `(success, frame_rgb, depth_or_
 ## Janelas e telemetria
 
 - **Debug & Tracking:** vídeo da fonte com máscara, vetores ou caixa/esqueleto conforme o algoritmo, FPS, latência, modo e fonte ativos.
-- **Projetor Corpo/Frontal:** MOG2/Kinect projetam a máscara vermelha; Optical Flow projeta vetores; YOLO projeta o mesmo esqueleto do Debug (ossos vermelhos finos, nós verdes e cabeça em anel vermelho).
+- **Projetor Corpo/Frontal:** MOG2/Kinect projetam a máscara vermelha; Optical Flow projeta vetores; YOLO projeta a malha interpessoal suavizada em fundo preto.
 
 As janelas Chão/Fundo e Simulação/Consolidada estão temporariamente desativadas; o loop não calcula centroide, ondas nem composição dessas telas.
 
