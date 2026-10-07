@@ -470,31 +470,6 @@ class VisionResult:
     body_frame: np.ndarray
 
 
-class PointSmoother:
-    def __init__(self, alpha: float = 0.2) -> None:
-        if not 0.0 < alpha <= 1.0:
-            raise ValueError("alpha deve estar no intervalo (0, 1]")
-        self.alpha = alpha
-        self._points: dict[tuple[int, int], np.ndarray] = {}
-
-    def reset(self) -> None:
-        self._points.clear()
-
-    def update(
-        self, points: dict[tuple[int, int], tuple[float, float]]
-    ) -> dict[tuple[int, int], tuple[float, float]]:
-        smoothed_points = {}
-        next_points = {}
-        for key, raw_position in points.items():
-            raw = np.asarray(raw_position, dtype=np.float32)
-            previous = self._points.get(key)
-            value = raw if previous is None else previous + self.alpha * (raw - previous)
-            next_points[key] = value
-            smoothed_points[key] = (float(value[0]), float(value[1]))
-        self._points = next_points
-        return smoothed_points
-
-
 def export_yolo_openvino_model(yolo_class=None) -> str:
     if os.path.isdir(YOLO_OPENVINO_MODEL):
         return YOLO_OPENVINO_MODEL
@@ -524,7 +499,6 @@ class VisionProcessor:
         self,
         mode: str,
         nogpu: bool = False,
-        alpha: float = 0.2,
         max_distance: float = 150.0,
     ) -> None:
         if mode not in self.MODE_LABELS:
@@ -533,7 +507,6 @@ class VisionProcessor:
             raise ValueError("max_distance deve ser maior que zero")
         self.mode = mode
         self.max_distance = max_distance
-        self._point_smoother = PointSmoother(alpha)
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._mog2 = None
         self._previous_gray: Optional[np.ndarray] = None
@@ -610,8 +583,6 @@ class VisionProcessor:
             self._reset_mog2()
         elif self.mode == "optical_flow":
             self._previous_gray = None
-        elif self.mode == "yolo":
-            self._point_smoother.reset()
 
     def _clean_mask(self, mask: np.ndarray) -> np.ndarray:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)
@@ -742,11 +713,10 @@ class VisionProcessor:
                             float(point[0]), float(point[1])
                         )
 
-        smoothed = self._point_smoother.update(raw_nodes)
         debug = frame_bgr.copy()
         body = np.zeros_like(frame_bgr)
         mask = np.zeros((height, width), dtype=np.uint8)
-        nodes = list(smoothed.items())
+        nodes = list(raw_nodes.items())
         if nodes:
             coordinates = np.asarray([position for _, position in nodes], dtype=np.float32)
             offsets = coordinates[:, None, :] - coordinates[None, :, :]
@@ -863,12 +833,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="forca YOLO em OpenVINO/CPU ou PyTorch CPU em vez de CUDA",
     )
     parser.add_argument(
-        "--alpha",
-        type=float,
-        default=0.2,
-        help="suavizacao EMA dos nos YOLO (padrao: 0.2)",
-    )
-    parser.add_argument(
         "--max-distance",
         type=float,
         default=150.0,
@@ -887,8 +851,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         args.mode = "kinect" if args.source == "kinect" else "mog2"
     if args.mode == "kinect" and args.source != "kinect":
         parser.error("--mode kinect requer --source kinect")
-    if not 0.0 < args.alpha <= 1.0:
-        parser.error("--alpha deve estar no intervalo (0, 1]")
     if args.max_distance <= 0:
         parser.error("--max-distance deve ser maior que zero")
     return args
@@ -904,14 +866,13 @@ def resolve_active_mode(requested_mode: str, capturer: CaptureSource) -> str:
 def make_vision_processor(
     mode: str,
     nogpu: bool = False,
-    alpha: float = 0.2,
     max_distance: float = 150.0,
 ) -> Optional[VisionProcessor]:
     return (
         None
         if mode == "kinect"
         else VisionProcessor(
-            mode, nogpu=nogpu, alpha=alpha, max_distance=max_distance
+            mode, nogpu=nogpu, max_distance=max_distance
         )
     )
 
@@ -928,7 +889,7 @@ def main() -> int:
     active_mode = resolve_active_mode(args.mode, capturer)
     try:
         processor = make_vision_processor(
-            active_mode, nogpu=args.nogpu, alpha=args.alpha, max_distance=args.max_distance
+            active_mode, nogpu=args.nogpu, max_distance=args.max_distance
         )
     except Exception as exc:
         capturer.close()
@@ -1070,7 +1031,6 @@ def main() -> int:
                         processor = make_vision_processor(
                             active_mode,
                             nogpu=args.nogpu,
-                            alpha=args.alpha,
                             max_distance=args.max_distance,
                         )
                     elif processor is not None:
