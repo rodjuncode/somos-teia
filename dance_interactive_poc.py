@@ -22,6 +22,7 @@ O modo Kinect usa profundidade em milimetros (DEPTH_MM).
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import threading
@@ -43,6 +44,10 @@ BACKGROUND_SAMPLE_COUNT = 15
 BACKGROUND_DIFF_MM = 80
 YOLO_PT_MODEL = "yolov8n-pose.pt"
 YOLO_OPENVINO_MODEL = "yolov8n-pose_openvino_model"
+# Entrada do YOLO (altura, largura) e limite de pessoas por frame.
+YOLO_INPUT_SIZE = (240, 320)
+YOLO_MAX_DETECTIONS = 16
+YOLO_MIN_KEYPOINT_CONFIDENCE = 0.25
 DEFAULT_MAX_CONNECTIONS = 5
 # (frame BGR, profundidade, mascara); fontes 2D nao tem profundidade nem mascara.
 FrameData = tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]
@@ -461,7 +466,7 @@ def create_capturer(
 
 @dataclass(slots=True)
 class VisionResult:
-    body_mask: np.ndarray
+    body_mask: Optional[np.ndarray]
     debug_frame: np.ndarray
     body_frame: np.ndarray
 
@@ -570,7 +575,7 @@ class PresentationDeadband:
         if threshold_px < 0:
             raise ValueError("point_deadband deve ser >= 0")
         self.threshold_px = threshold_px
-        self._positions: dict[tuple[int, int], np.ndarray] = {}
+        self._positions: dict[tuple[int, int], tuple[float, float]] = {}
 
     def reset(self) -> None:
         self._positions.clear()
@@ -578,23 +583,21 @@ class PresentationDeadband:
     def apply(
         self, points: dict[tuple[int, int], tuple[float, float]]
     ) -> dict[tuple[int, int], tuple[float, float]]:
+        threshold = self.threshold_px
+        previous_positions = self._positions
         stabilized = {}
-        next_positions = {}
-        for key, position in points.items():
-            current = np.asarray(position, dtype=np.float32)
-            previous = self._positions.get(key)
-            if previous is not None and self.threshold_px > 0:
-                delta = current - previous
-                distance = float(np.linalg.norm(delta))
-                if distance <= self.threshold_px:
-                    current = previous
+        for key, (x, y) in points.items():
+            previous = previous_positions.get(key)
+            if previous is not None and threshold > 0:
+                dx, dy = x - previous[0], y - previous[1]
+                distance = math.hypot(dx, dy)
+                if distance <= threshold:
+                    x, y = previous
                 else:
-                    current = previous + delta * (
-                        (distance - self.threshold_px) / distance
-                    )
-            next_positions[key] = current
-            stabilized[key] = (float(current[0]), float(current[1]))
-        self._positions = next_positions
+                    step = (distance - threshold) / distance
+                    x, y = previous[0] + dx * step, previous[1] + dy * step
+            stabilized[key] = (x, y)
+        self._positions = stabilized
         return stabilized
 
 
@@ -608,6 +611,41 @@ def export_yolo_openvino_model(yolo_class=None) -> str:
     if not os.path.isdir(YOLO_OPENVINO_MODEL):
         raise RuntimeError(f"A exportacao nao criou {YOLO_OPENVINO_MODEL}")
     return YOLO_OPENVINO_MODEL
+
+
+class UltralyticsPoseBackend:
+    """Runs an Ultralytics pose model and returns keypoints as NumPy arrays."""
+
+    def __init__(self, model, device: Optional[int | str] = None) -> None:
+        self._model = model
+        self._options = {"device": device} if device is not None else {}
+
+    @staticmethod
+    def _to_numpy(value) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "numpy"):
+            value = value.numpy()
+        return np.asarray(value)
+
+    def keypoints(
+        self, frame_bgr: np.ndarray
+    ) -> tuple[np.ndarray, Optional[np.ndarray]]:
+        """Returns (people, 17, 2) image coordinates and (people, 17) confidences."""
+        result = self._model(
+            frame_bgr,
+            imgsz=YOLO_INPUT_SIZE[1],
+            max_det=YOLO_MAX_DETECTIONS,
+            verbose=False,
+            **self._options,
+        )[0]
+        keypoints = getattr(result, "keypoints", None)
+        points = self._to_numpy(getattr(keypoints, "xy", None))
+        if points is None:
+            points = np.empty((0, 17, 2), dtype=np.float32)
+        return points, self._to_numpy(getattr(keypoints, "conf", None))
 
 
 class VisionProcessor:
@@ -628,6 +666,9 @@ class VisionProcessor:
         (13, (13, 14)),
         (15, (15, 16)),
     )
+    FACE_KEYPOINTS = np.array((0, 1, 2, 3, 4), dtype=np.intp)
+    LEFT_KEYPOINTS = np.array((5, 7, 9, 11, 13, 15), dtype=np.intp)
+    RIGHT_KEYPOINTS = LEFT_KEYPOINTS + 1
     MOG2_SCALE = 0.25
     FLOW_SCALE = 0.125
     FLOW_THRESHOLD = 0.15
@@ -658,8 +699,7 @@ class VisionProcessor:
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._mog2 = None
         self._previous_gray: Optional[np.ndarray] = None
-        self._yolo = None
-        self._yolo_device: Optional[int | str] = None
+        self._yolo: Optional[UltralyticsPoseBackend] = None
         self._yolo_backend: Optional[str] = None
         if mode == "mog2":
             self._reset_mog2()
@@ -684,8 +724,7 @@ class VisionProcessor:
 
         cuda_available = bool(torch.cuda.is_available())
         if cuda_available and not nogpu:
-            self._yolo = YOLO(YOLO_PT_MODEL)
-            self._yolo_device = 0
+            self._yolo = UltralyticsPoseBackend(YOLO(YOLO_PT_MODEL), device=0)
             self._yolo_backend = "CUDA / NVIDIA GPU"
             return
 
@@ -707,7 +746,7 @@ class VisionProcessor:
                 return
 
         try:
-            self._yolo = YOLO(YOLO_OPENVINO_MODEL)
+            self._yolo = UltralyticsPoseBackend(YOLO(YOLO_OPENVINO_MODEL))
             self._yolo_backend = "OpenVINO / CPU Intel"
         except Exception as exc:
             self._load_yolo_cpu(YOLO, f"falha ao carregar OpenVINO: {exc}")
@@ -717,8 +756,7 @@ class VisionProcessor:
             f"Aviso: {reason}; usando YOLO PyTorch em CPU.",
             file=sys.stderr,
         )
-        self._yolo = yolo_class(YOLO_PT_MODEL)
-        self._yolo_device = "cpu"
+        self._yolo = UltralyticsPoseBackend(yolo_class(YOLO_PT_MODEL), device="cpu")
         self._yolo_backend = "PyTorch CPU"
 
     def _reset_mog2(self) -> None:
@@ -815,16 +853,6 @@ class VisionProcessor:
         return VisionResult(mask, debug, body)
 
     @staticmethod
-    def _to_numpy(value) -> Optional[np.ndarray]:
-        if value is None:
-            return None
-        if hasattr(value, "cpu"):
-            value = value.cpu()
-        if hasattr(value, "numpy"):
-            value = value.numpy()
-        return np.asarray(value)
-
-    @staticmethod
     def _select_mesh_edges(
         coordinates: np.ndarray,
         max_distance: float,
@@ -876,109 +904,114 @@ class VisionProcessor:
             np.sqrt(squared_distances[selected]),
         )
 
+    def _build_nodes(
+        self, points: np.ndarray, confidence: Optional[np.ndarray], width: int, height: int
+    ) -> dict[tuple[int, int], tuple[float, float]]:
+        """Collapses COCO keypoints into one head node and one node per bilateral class."""
+        if points.size == 0:
+            return {}
+        with np.errstate(invalid="ignore"):
+            valid = (
+                np.isfinite(points).all(axis=2)
+                & (points[:, :, 0] >= 0)
+                & (points[:, :, 0] < width)
+                & (points[:, :, 1] >= 0)
+                & (points[:, :, 1] < height)
+            )
+        if confidence is not None:
+            valid &= confidence[: len(points)] >= YOLO_MIN_KEYPOINT_CONFIDENCE
+
+        face_valid = valid[:, self.FACE_KEYPOINTS]
+        face_count = face_valid.sum(axis=1)
+        face_points = np.where(face_valid[:, :, None], points[:, self.FACE_KEYPOINTS], 0.0)
+        heads = face_points.sum(axis=1) / np.maximum(face_count, 1)[:, None]
+
+        left_valid = valid[:, self.LEFT_KEYPOINTS]
+        joints = np.where(
+            left_valid[:, :, None],
+            points[:, self.LEFT_KEYPOINTS],
+            points[:, self.RIGHT_KEYPOINTS],
+        )
+        joints_valid = left_valid | valid[:, self.RIGHT_KEYPOINTS]
+
+        nodes: dict[tuple[int, int], tuple[float, float]] = {}
+        head_list, joint_list = heads.tolist(), joints.tolist()
+        for person_index in np.flatnonzero(face_count).tolist():
+            nodes[(person_index, self.HEAD_NODE)] = tuple(head_list[person_index])
+        for person_index, slot in zip(*np.nonzero(joints_valid)):
+            node_class = int(self.LEFT_KEYPOINTS[slot])
+            nodes[(int(person_index), node_class)] = tuple(joint_list[person_index][slot])
+        return nodes
+
     def _process_yolo(self, frame_bgr: np.ndarray) -> VisionResult:
         height, width = frame_bgr.shape[:2]
-        frame_320 = cv2.resize(frame_bgr, (320, 240), interpolation=cv2.INTER_AREA)
-        inference_options = {}
-        if self._yolo_device is not None:
-            inference_options["device"] = self._yolo_device
-        predictions = self._yolo(
-            frame_320, imgsz=320, max_det=16, verbose=False, **inference_options
+        input_height, input_width = YOLO_INPUT_SIZE
+        frame_small = cv2.resize(
+            frame_bgr, (input_width, input_height), interpolation=cv2.INTER_AREA
         )
-        result = predictions[0]
-        scale_x, scale_y = width / 320.0, height / 240.0
-        keypoints = getattr(result, "keypoints", None)
-        points_by_person = self._to_numpy(getattr(keypoints, "xy", None))
-        confidence = self._to_numpy(getattr(keypoints, "conf", None))
-        raw_nodes: dict[tuple[int, int], tuple[float, float]] = {}
-        point_scale = np.array((scale_x, scale_y), dtype=np.float32)
-        if points_by_person is not None:
-            for person_index, points in enumerate(points_by_person):
-                points = points * point_scale
-                valid = (
-                    np.isfinite(points).all(axis=1)
-                    & (points[:, 0] >= 0)
-                    & (points[:, 0] < width)
-                    & (points[:, 1] >= 0)
-                    & (points[:, 1] < height)
-                )
-                if confidence is not None and person_index < len(confidence):
-                    valid &= confidence[person_index] >= 0.25
-                for node_class, keypoint_indices in self.NODE_GROUPS:
-                    indices = np.asarray(
-                        [index for index in keypoint_indices if index < len(points)],
-                        dtype=np.intp,
-                    )
-                    visible = indices[valid[indices]]
-                    if visible.size == 0:
-                        continue
-                    point = (
-                        points[visible].mean(axis=0)
-                        if node_class == self.HEAD_NODE
-                        else points[visible[0]]
-                    )
-                    raw_nodes[(person_index, node_class)] = (
-                        float(point[0]), float(point[1])
-                    )
-
+        points, confidence = self._yolo.keypoints(frame_small)
+        points = np.asarray(points, dtype=np.float32) * np.array(
+            (width / input_width, height / input_height), dtype=np.float32
+        )
+        raw_nodes = self._build_nodes(points, confidence, width, height)
         stable_nodes = self._presentation_deadband.apply(raw_nodes)
-        debug = frame_bgr.copy()
-        body = np.zeros_like(frame_bgr)
-        mask = np.zeros((height, width), dtype=np.uint8)
-        nodes = list(stable_nodes.items())
         self._mesh_connections = {
             edge: alpha
             for edge, alpha in self._mesh_connections.items()
             if edge[0] in stable_nodes and edge[1] in stable_nodes
         }
-        if nodes:
-            coordinates = np.asarray([position for _, position in nodes], dtype=np.float32)
-            node_indices = {key: index for index, (key, _) in enumerate(nodes)}
-            degrees = np.zeros(len(nodes), dtype=np.int32)
-            connected = set()
-            for key_a, key_b in self._mesh_connections:
-                index_a, index_b = node_indices[key_a], node_indices[key_b]
-                degrees[index_a] += 1
-                degrees[index_b] += 1
-                connected.add((min(index_a, index_b), max(index_a, index_b)))
-            first, second, edge_distances = self._select_mesh_edges(
-                coordinates,
-                self.max_distance,
-                self.max_connections,
-                degrees,
-                frozenset(connected),
+
+        debug = frame_bgr.copy()
+        body = np.zeros_like(frame_bgr)
+        if not stable_nodes:
+            return VisionResult(None, debug, body)
+
+        nodes = list(stable_nodes.items())
+        coordinates = np.asarray([position for _, position in nodes], dtype=np.float32)
+        node_indices = {key: index for index, (key, _) in enumerate(nodes)}
+        degrees = np.zeros(len(nodes), dtype=np.int32)
+        connected = set()
+        for key_a, key_b in self._mesh_connections:
+            index_a, index_b = node_indices[key_a], node_indices[key_b]
+            degrees[index_a] += 1
+            degrees[index_b] += 1
+            connected.add((min(index_a, index_b), max(index_a, index_b)))
+        first, second, edge_distances = self._select_mesh_edges(
+            coordinates,
+            self.max_distance,
+            self.max_connections,
+            degrees,
+            frozenset(connected),
+        )
+        for node_a, node_b, distance in zip(
+            first.tolist(), second.tolist(), edge_distances.tolist()
+        ):
+            edge = (nodes[node_a][0], nodes[node_b][0])
+            self._mesh_connections[edge] = 1.0 - distance / self.max_distance
+
+        # Desenha direto nos dois quadros: evita addWeighted em tela cheia.
+        pixels = np.rint(coordinates).astype(np.int32).tolist()
+        for (key_a, key_b), line_alpha in self._mesh_connections.items():
+            color_value = int(255 * line_alpha)
+            line_color = (
+                color_value,
+                int(color_value * 0.78),
+                int(color_value * 0.45),
             )
-            for node_a, node_b, distance in zip(first, second, edge_distances):
-                edge = (nodes[node_a][0], nodes[node_b][0])
-                self._mesh_connections[edge] = 1.0 - float(distance) / self.max_distance
+            debug_color = tuple(int(channel * 0.85) for channel in line_color)
+            thickness = 1 + int(line_alpha * 2)
+            point_a = pixels[node_indices[key_a]]
+            point_b = pixels[node_indices[key_b]]
+            cv2.line(body, point_a, point_b, line_color, thickness, cv2.LINE_AA)
+            cv2.line(debug, point_a, point_b, debug_color, thickness, cv2.LINE_AA)
 
-            for (key_a, key_b), line_alpha in self._mesh_connections.items():
-                node_a, node_b = node_indices[key_a], node_indices[key_b]
-                color_value = int(255 * line_alpha)
-                line_color = (
-                    color_value,
-                    int(color_value * 0.78),
-                    int(color_value * 0.45),
-                )
-                thickness = 1 + int(line_alpha * 2)
-                point_a = tuple(np.rint(coordinates[node_a]).astype(int))
-                point_b = tuple(np.rint(coordinates[node_b]).astype(int))
-                cv2.line(body, point_a, point_b, line_color, thickness, cv2.LINE_AA)
-                cv2.line(mask, point_a, point_b, 255, thickness, cv2.LINE_AA)
-
-            for node_key, position in nodes:
-                point = tuple(np.rint(position).astype(int))
-                is_head = node_key[1] == self.HEAD_NODE
-                radius = 7 if is_head else 5
-                if self.show_points:
-                    cv2.circle(body, point, radius + 3, (0, 55, 0), -1, cv2.LINE_AA)
-                    cv2.circle(body, point, radius, (0, 255, 0), -1, cv2.LINE_AA)
-                cv2.circle(mask, point, radius + 3, 255, -1, cv2.LINE_AA)
-
-        mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)[1]
-        if nodes:
-            debug = cv2.addWeighted(debug, 1.0, body, 0.85, 0.0)
-        return VisionResult(mask, debug, body)
+        if self.show_points:
+            for (node_key, _), point in zip(nodes, pixels):
+                radius = 7 if node_key[1] == self.HEAD_NODE else 5
+                for image in (body, debug):
+                    cv2.circle(image, point, radius + 3, (0, 55, 0), -1, cv2.LINE_AA)
+                    cv2.circle(image, point, radius, (0, 255, 0), -1, cv2.LINE_AA)
+        return VisionResult(None, debug, body)
 
 
 def latency_color(latency_ms: float) -> tuple[int, int, int]:
