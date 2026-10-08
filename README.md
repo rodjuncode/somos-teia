@@ -65,7 +65,7 @@ python dance_interactive_poc.py --source ensaio.mp4 --mode mog2
 python dance_interactive_poc.py --source ensaio.mp4 --mode optical_flow
 python dance_interactive_poc.py --source ensaio.mp4 --mode yolo
 python dance_interactive_poc.py --source ensaio.mp4 --mode yolo --nogpu
-python dance_interactive_poc.py --source ensaio.mp4 --mode yolo --nogpu --int8
+python dance_interactive_poc.py --source ensaio.mp4 --mode yolo --nogpu --no-int8
 python dance_interactive_poc.py --source ensaio.mp4 --mode yolo --max-distance 150 --max-connections 5 --point-deadband 4
 python dance_interactive_poc.py --source ensaio.mp4 --mode yolo --show-points
 python dance_interactive_poc.py --source kinect --mode kinect
@@ -77,8 +77,8 @@ Para fontes webcam/vídeo, o modo padrão é `mog2`. `--mode kinect` exige `--so
 - **Optical Flow:** Farneback roda em 80×60 entre frames cinza consecutivos; a máscara seleciona movimento acima de 0,15 px nessa escala (~1,2 px na imagem original) e a janela Corpo mostra vetores ampliados e recortados pela máscara.
 - **YOLO:** `yolov8n-pose.pt`, inferência em `imgsz=320` com até 16 detecções por frame para limitar o pós-processamento; cada dançarino gera sete nós: cabeça (média de nariz/olhos/orelhas) e um nó por classe bilateral (ombro, cotovelo, pulso/mão, quadril, joelho e tornozelo), usando o ponto esquerdo quando visível e o direito como fallback, sem criar um ponto médio artificial. Os círculos dos nós ficam ocultos por padrão; `--show-points` os habilita. `--point-deadband` (padrão 4 px) ignora tremor pequeno sem EMA; movimentos maiores avançam no mesmo frame. As distâncias entre os nós que ainda têm conexões livres são calculadas de uma vez em NumPy, respeitando `--max-distance` (padrão 150 px), e as arestas mais próximas são escolhidas até `--max-connections` por nó (padrão 5). Com no máximo 112 nós (16 dançarinos × 7), essa busca vetorizada mede 0,1–0,6 ms, de 5× a 80× mais rápida que o quadtree em Python usado antes. Conexões são persistentes: depois de criada, uma aresta não é recalculada — o desenho apenas acompanha os dois nós, mesmo que se afastem além de `--max-distance` — e só é liberada quando um dos nós deixa de ser detectado; a busca considera apenas nós com conexões livres. Brilho e espessura são definidos pela proximidade no momento em que a conexão nasce; os segmentos rígidos YOLO são ignorados.
 - **YOLO com GPU:** com CUDA, a rede PyTorch é capturada uma vez como CUDA Graph e reexecutada a cada frame com uma única chamada. Lançar as ~200 camadas a partir do Python custava mais CPU do que a GPU gasta no yolov8n: medido aqui, a inferência caiu de ~15 ms para ~2,8 ms e o modo YOLO foi de ~24 para ~50 fps. Os keypoints são idênticos aos do Ultralytics. Se a captura do grafo falhar, a PoC avisa e usa o Ultralytics em CUDA.
-- **YOLO sem GPU:** `--nogpu` prefere OpenVINO/CPU, chamado diretamente (sem o pré/pós-processamento do Ultralytics), com um modelo exportado em entrada retangular 256×320: o frame 320×240 recebe só 16 linhas de borda, em vez de 80 no modelo quadrado. Os keypoints são idênticos aos do Ultralytics com o mesmo modelo. Se `yolov8n-pose_256x320_openvino_model/` não existir, a PoC exporta o `.pt` automaticamente. Se OpenVINO ou a exportação falharem, usa PyTorch CPU e avisa no terminal. Sem `--nogpu`, CUDA disponível tem prioridade.
-- **INT8 (opcional):** `--nogpu --int8` usa `yolov8n-pose_256x320_int8_openvino_model/`, quantizado com NNCF. Medido neste PC: ~40% mais FPS que o FP32 (14 → 20 fps), mas os keypoints tremem mais (≈1 px a mais de variação frame a frame, na escala 320, e até ~4 px no p90 em 1280×720) — compense com `--point-deadband` maior se necessário. A exportação automática calibra com o `coco8-pose.yaml` do Ultralytics (baixa ~1 MB e instala `nncf` na primeira vez); para calibrar com frames dos ensaios, chame `export_yolo_openvino_model(int8=True, calibration_data='dados.yaml')`.
+- **YOLO sem GPU:** `--nogpu` prefere OpenVINO/CPU, chamado diretamente (sem o pré/pós-processamento do Ultralytics), com um modelo exportado em entrada retangular 256×320: o frame 320×240 recebe só 16 linhas de borda, em vez de 80 no modelo quadrado. Os keypoints são idênticos aos do Ultralytics com o mesmo modelo. Se o modelo não existir, a PoC exporta o `.pt` automaticamente. Se o INT8 não puder ser exportado ou carregado, tenta o FP32; se OpenVINO ou as exportações falharem, usa PyTorch CPU e avisa no terminal. Sem `--nogpu`, CUDA disponível tem prioridade.
+- **INT8 (padrão em CPU):** `--nogpu` usa `yolov8n-pose_256x320_int8_openvino_model/`, quantizado com NNCF; `--no-int8` volta ao FP32 `yolov8n-pose_256x320_openvino_model/`. Medido neste PC: ~40% mais FPS que o FP32 (14 → 20 fps), mas os keypoints tremem mais (≈1 px a mais de variação frame a frame, na escala 320, e até ~4 px no p90 em 1280×720) — compense com `--point-deadband` maior ou use `--no-int8` se necessário. Com CUDA, `--int8` é ignorado. A exportação automática calibra com o `coco8-pose.yaml` do Ultralytics (baixa ~1 MB e instala `nncf` na primeira vez); para calibrar com frames dos ensaios, chame `export_yolo_openvino_model(int8=True, calibration_data='dados.yaml')`.
 - **Kinect:** máscara RAW pela faixa de profundidade, com calibração de fundo opcional pela tecla `b`.
 
 As metas de latência (<8 ms MOG2, <5 ms Farneback, <20 ms YOLO) são metas por algoritmo, não garantias de latência ponta a ponta. A janela debug/projetores e o FPS de captura também consomem tempo; valide com `kinect_diagnostic.py`/telemetria no hardware final.
@@ -125,10 +125,10 @@ Comparação entre `v0.17.1` e `v0.18.2`, no PC de desenvolvimento (Intel 4 núc
 | Modo | v0.17.1 | v0.18.2 |
 | --- | --- | --- |
 | YOLO CUDA, vídeo | 18,0 fps · 58 ms | 53,3 fps · 18 ms |
-| YOLO `--nogpu`, vídeo | 8,3 fps · 127 ms | 13,6 fps · 78 ms |
-| YOLO `--nogpu --int8`, vídeo | — | 23,5 fps · 49 ms |
+| YOLO `--nogpu` FP32 (hoje `--no-int8`), vídeo | 8,3 fps · 127 ms | 13,6 fps · 78 ms |
+| YOLO `--nogpu` INT8 (padrão desde v0.19.0), vídeo | — | 23,5 fps · 49 ms |
 | YOLO CUDA, Kinect | 30 fps · 23 ms | 30 fps · 14 ms |
-| YOLO `--nogpu`, Kinect | 21,8 fps · 58 ms | 27,4 fps · 28 ms |
+| YOLO `--nogpu` FP32, Kinect | 21,8 fps · 58 ms | 27,4 fps · 28 ms |
 | MOG2, vídeo (`MVI_1724.MOV`) | 36,0 fps · 37 ms | 47,9 fps · 30 ms |
 | Kinect (profundidade) | 30 fps · 9 ms | 30 fps · 16 ms |
 

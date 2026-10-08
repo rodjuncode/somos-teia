@@ -722,7 +722,7 @@ class VisionProcessor:
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         point_deadband: float = 4.0,
         show_points: bool = False,
-        int8: bool = False,
+        int8: Optional[bool] = None,
     ) -> None:
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Modo 2D desconhecido: {mode}")
@@ -756,7 +756,7 @@ class VisionProcessor:
             return f"YOLOv8 Pose [{self._yolo_backend}]"
         return self.MODE_LABELS[self.mode]
 
-    def _load_yolo(self, nogpu: bool, int8: bool = False) -> None:
+    def _load_yolo(self, nogpu: bool, int8: Optional[bool] = None) -> None:
         try:
             import torch
             from ultralytics import YOLO
@@ -788,24 +788,34 @@ class VisionProcessor:
             self._load_yolo_cpu(YOLO, "OpenVINO ausente")
             return
 
-        model_dir = YOLO_OPENVINO_INT8_MODEL if int8 else YOLO_OPENVINO_MODEL
-        if not os.path.isdir(model_dir):
-            print(
-                f"Modelo OpenVINO ausente; exportando {YOLO_PT_MODEL} para {model_dir}...",
-                flush=True,
-            )
+        # Em CPU, INT8 e o padrao; --no-int8 pede o FP32. Se o INT8 nao puder ser
+        # exportado ou carregado, tenta o FP32 antes de cair para PyTorch CPU.
+        variants = [(YOLO_OPENVINO_MODEL, False, "OpenVINO / CPU")]
+        if int8 is not False:
+            variants.insert(0, (YOLO_OPENVINO_INT8_MODEL, True, "OpenVINO INT8 / CPU"))
+        failure = ""
+        for model_dir, quantized, label in variants:
+            if not os.path.isdir(model_dir):
+                print(
+                    f"Modelo OpenVINO ausente; exportando {YOLO_PT_MODEL} para {model_dir}...",
+                    flush=True,
+                )
+                try:
+                    export_yolo_openvino_model(YOLO, int8=quantized)
+                except Exception as exc:
+                    failure = f"falha na exportacao OpenVINO: {exc}"
+                    print(f"Aviso: {failure}", file=sys.stderr)
+                    continue
             try:
-                export_yolo_openvino_model(YOLO, int8=int8)
+                self._yolo = OpenVINOPoseBackend(model_dir)
             except Exception as exc:
-                self._load_yolo_cpu(YOLO, f"falha na exportacao OpenVINO: {exc}")
-                return
-
-        try:
-            self._yolo = OpenVINOPoseBackend(model_dir)
-            self._yolo_backend = "OpenVINO INT8 / CPU" if int8 else "OpenVINO / CPU"
+                failure = f"falha ao carregar OpenVINO: {exc}"
+                print(f"Aviso: {failure}", file=sys.stderr)
+                continue
+            self._yolo_backend = label
             self.cpu_inference = True
-        except Exception as exc:
-            self._load_yolo_cpu(YOLO, f"falha ao carregar OpenVINO: {exc}")
+            return
+        self._load_yolo_cpu(YOLO, failure)
 
     def _load_yolo_cpu(self, yolo_class, reason: str) -> None:
         print(
@@ -1269,8 +1279,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--int8",
-        action="store_true",
-        help="com OpenVINO/CPU, usa o modelo quantizado INT8: ~40%% mais rapido, keypoints menos estaveis",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="com OpenVINO/CPU, usa o modelo quantizado INT8 (padrao); --no-int8 usa o FP32: "
+        "~40%% mais lento, keypoints mais estaveis",
     )
     parser.add_argument(
         "--max-distance",
@@ -1331,7 +1343,7 @@ def make_vision_processor(
     max_connections: int = DEFAULT_MAX_CONNECTIONS,
     point_deadband: float = 4.0,
     show_points: bool = False,
-    int8: bool = False,
+    int8: Optional[bool] = None,
 ) -> Optional[VisionProcessor]:
     return (
         None
