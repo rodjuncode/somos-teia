@@ -57,6 +57,17 @@ YOLO_MIN_KEYPOINT_CONFIDENCE = 0.25
 YOLO_DETECTION_CONFIDENCE = 0.25
 YOLO_NMS_IOU = 0.7
 DEFAULT_MAX_CONNECTIONS = 5
+EDGE_STYLES = ("line", "bezier")
+# Pontos de controle Bezier, relativos a aresta a->b: posicao ao longo dela
+# (fracao do comprimento) e desvio perpendicular maximo (fracao do comprimento).
+BEZIER_CONTROL_SPANS = ((0.15, 0.45), (0.55, 0.85))
+BEZIER_MAX_BEND = 0.5
+BEZIER_SAMPLES = 20
+_t = np.linspace(0.0, 1.0, BEZIER_SAMPLES, dtype=np.float32)[:, None]
+BEZIER_BASIS = np.hstack(
+    ((1 - _t) ** 3, 3 * (1 - _t) ** 2 * _t, 3 * (1 - _t) * _t**2, _t**3)
+)
+del _t
 # Medido em H.264 720p60: 2 threads decodificam em ~4 ms/frame com ~40% da CPU
 # gasta pelo padrao do FFmpeg (8 threads), deixando nucleos livres para a inferencia.
 VIDEO_DECODE_THREADS = 2
@@ -723,6 +734,7 @@ class VisionProcessor:
         point_deadband: float = 4.0,
         show_points: bool = False,
         int8: Optional[bool] = None,
+        edge_style: str = "line",
     ) -> None:
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Modo 2D desconhecido: {mode}")
@@ -730,7 +742,10 @@ class VisionProcessor:
             raise ValueError("max_distance deve ser maior que zero")
         if max_connections < 1:
             raise ValueError("max_connections deve ser pelo menos 1")
+        if edge_style not in EDGE_STYLES:
+            raise ValueError(f"Estilo de aresta desconhecido: {edge_style}")
         self.mode = mode
+        self.edge_style = edge_style
         self.max_distance = max_distance
         self.max_connections = max_connections
         self.show_points = show_points
@@ -738,6 +753,12 @@ class VisionProcessor:
         self._mesh_connections: dict[
             tuple[tuple[int, int], tuple[int, int]], float
         ] = {}
+        # Pontos de controle Bezier de cada aresta, sorteados quando ela nasce:
+        # linhas (t, desvio) para os dois controles, relativas ao segmento a->b.
+        self._edge_controls: dict[
+            tuple[tuple[int, int], tuple[int, int]], np.ndarray
+        ] = {}
+        self._rng = np.random.default_rng()
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._mog2 = None
         self._previous_gray: Optional[np.ndarray] = None
@@ -839,6 +860,7 @@ class VisionProcessor:
         elif self.mode == "yolo":
             self._presentation_deadband.reset()
             self._mesh_connections.clear()
+            self._edge_controls.clear()
 
     def _clean_mask(self, mask: np.ndarray) -> np.ndarray:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)
@@ -1013,6 +1035,35 @@ class VisionProcessor:
             nodes[(int(person_index), node_class)] = tuple(joint_list[person_index][slot])
         return nodes
 
+    def _random_bezier_controls(self) -> np.ndarray:
+        positions = [self._rng.uniform(low, high) for low, high in BEZIER_CONTROL_SPANS]
+        bends = self._rng.uniform(-BEZIER_MAX_BEND, BEZIER_MAX_BEND, size=2)
+        return np.array(list(zip(positions, bends)), dtype=np.float32)
+
+    def _bezier_polylines(
+        self, coordinates: np.ndarray, node_indices: dict[tuple[int, int], int]
+    ) -> np.ndarray:
+        """Amostra as curvas de todas as arestas, na ordem de _mesh_connections."""
+        edges = list(self._mesh_connections)
+        if not edges:
+            return np.empty((0, BEZIER_SAMPLES, 2), dtype=np.int32)
+        start = coordinates[[node_indices[a] for a, _ in edges]]
+        end = coordinates[[node_indices[b] for _, b in edges]]
+        controls = np.stack([self._edge_controls[edge] for edge in edges])
+        direction = end - start
+        normal = np.stack((-direction[:, 1], direction[:, 0]), axis=1)
+        # Controles acompanham as pontas: escalam e giram junto com a aresta.
+        control_points = (
+            start[:, None]
+            + controls[:, :, :1] * direction[:, None]
+            + controls[:, :, 1:] * normal[:, None]
+        )
+        anchors = np.concatenate(
+            (start[:, None], control_points, end[:, None]), axis=1
+        )
+        curves = np.einsum("sk,ekd->esd", BEZIER_BASIS, anchors)
+        return np.rint(curves).astype(np.int32)
+
     def _process_yolo(self, frame_bgr: np.ndarray) -> VisionResult:
         height, width = frame_bgr.shape[:2]
         input_height, input_width = YOLO_INPUT_SIZE
@@ -1039,6 +1090,10 @@ class VisionProcessor:
             for edge, alpha in self._mesh_connections.items()
             if edge[0] in stable_nodes and edge[1] in stable_nodes
         }
+        if self.edge_style == "bezier":
+            self._edge_controls = {
+                edge: self._edge_controls[edge] for edge in self._mesh_connections
+            }
 
         debug = frame_bgr.copy()
         body = np.zeros_like(frame_bgr)
@@ -1067,10 +1122,19 @@ class VisionProcessor:
         ):
             edge = (nodes[node_a][0], nodes[node_b][0])
             self._mesh_connections[edge] = 1.0 - distance / self.max_distance
+            if self.edge_style == "bezier":
+                self._edge_controls[edge] = self._random_bezier_controls()
 
         # Desenha direto nos dois quadros: evita addWeighted em tela cheia.
         pixels = np.rint(coordinates).astype(np.int32).tolist()
-        for (key_a, key_b), line_alpha in self._mesh_connections.items():
+        curves = (
+            self._bezier_polylines(coordinates, node_indices)
+            if self.edge_style == "bezier"
+            else None
+        )
+        for edge_index, ((key_a, key_b), line_alpha) in enumerate(
+            self._mesh_connections.items()
+        ):
             color_value = int(255 * line_alpha)
             line_color = (
                 color_value,
@@ -1079,6 +1143,11 @@ class VisionProcessor:
             )
             debug_color = tuple(int(channel * 0.85) for channel in line_color)
             thickness = 1 + int(line_alpha * 2)
+            if curves is not None:
+                curve = [curves[edge_index]]
+                cv2.polylines(body, curve, False, line_color, thickness, cv2.LINE_AA)
+                cv2.polylines(debug, curve, False, debug_color, thickness, cv2.LINE_AA)
+                continue
             point_a = pixels[node_indices[key_a]]
             point_b = pixels[node_indices[key_b]]
             cv2.line(body, point_a, point_b, line_color, thickness, cv2.LINE_AA)
@@ -1307,6 +1376,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="mostra circulos das articulacoes e cabeca na malha YOLO",
     )
+    parser.add_argument(
+        "--edge-style",
+        choices=EDGE_STYLES,
+        default="line",
+        help="formato das ligacoes YOLO: line (hastes retas, padrao) ou bezier "
+        "(curvas com pontos de controle sorteados quando a ligacao nasce)",
+    )
     parser.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH_MM, help="profundidade minima em mm (padrao: %(default)s)")
     parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH_MM, help="profundidade maxima em mm (padrao: %(default)s)")
     args = parser.parse_args(argv)
@@ -1344,6 +1420,7 @@ def make_vision_processor(
     point_deadband: float = 4.0,
     show_points: bool = False,
     int8: Optional[bool] = None,
+    edge_style: str = "line",
 ) -> Optional[VisionProcessor]:
     return (
         None
@@ -1356,6 +1433,7 @@ def make_vision_processor(
             point_deadband=point_deadband,
             show_points=show_points,
             int8=int8,
+            edge_style=edge_style,
         )
     )
 
@@ -1379,6 +1457,7 @@ def main() -> int:
             point_deadband=args.point_deadband,
             show_points=args.show_points,
             int8=args.int8,
+            edge_style=args.edge_style,
         )
     except Exception as exc:
         capturer.close()
@@ -1511,6 +1590,7 @@ def main() -> int:
                             point_deadband=args.point_deadband,
                             show_points=args.show_points,
                             int8=args.int8,
+            edge_style=args.edge_style,
                         )
                     elif processor is not None:
                         processor.reset()
