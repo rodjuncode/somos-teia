@@ -1173,8 +1173,10 @@ def main() -> int:
             if cached_images is None:
                 cv2.waitKey(1)
                 continue
-            for window, image in zip(windows, cached_images):
-                cv2.imshow(window, image)
+            # O Qt mantem a ultima imagem; reenviar o mesmo frame so gasta CPU.
+            if is_new_frame:
+                for window, image in zip(windows, cached_images):
+                    cv2.imshow(window, image)
             key = cv2.waitKey(1) & 0xFF
             if is_new_frame:
                 last_latency_ms = (time.perf_counter() - frame_start) * 1000.0
