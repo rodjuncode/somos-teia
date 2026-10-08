@@ -538,24 +538,16 @@ def export_yolo_openvino_model(
     return target
 
 
-class OpenVINOPoseBackend:
-    """Runs an exported YOLO pose model on OpenVINO without Ultralytics overhead."""
+class LetterboxPoseBackend:
+    """Shared YOLO pose pre/post-processing; subclasses run the raw network."""
 
-    def __init__(self, model_dir: str) -> None:
-        import openvino as ov
+    def __init__(self, input_size: tuple[int, int]) -> None:
+        self._input_size = input_size
+        self._canvas = np.full((*input_size, 3), 114, dtype=np.uint8)
 
-        xml_files = [name for name in os.listdir(model_dir) if name.endswith(".xml")]
-        if len(xml_files) != 1:
-            raise RuntimeError(f"Esperado um .xml em {model_dir}")
-        compiled = ov.Core().compile_model(
-            os.path.join(model_dir, xml_files[0]),
-            "CPU",
-            {"PERFORMANCE_HINT": "LATENCY"},
-        )
-        self._request = compiled.create_infer_request()
-        _, _, input_height, input_width = (int(size) for size in compiled.inputs[0].shape)
-        self._input_size = (input_height, input_width)
-        self._canvas = np.full((input_height, input_width, 3), 114, dtype=np.uint8)
+    def _infer(self, blob: np.ndarray) -> np.ndarray:
+        """Returns the (56, anchors) output: box, score and 17 x (x, y, conf)."""
+        raise NotImplementedError
 
     def keypoints(
         self, frame_bgr: np.ndarray
@@ -574,9 +566,7 @@ class OpenVINOPoseBackend:
         left = round((input_width - resized_width) / 2 - 0.1)
         self._canvas[:] = 114
         self._canvas[top : top + resized_height, left : left + resized_width] = frame_bgr
-        blob = cv2.dnn.blobFromImage(self._canvas, 1.0 / 255.0, swapRB=True)
-        self._request.infer({0: blob})
-        output = self._request.get_output_tensor(0).data[0]
+        output = self._infer(cv2.dnn.blobFromImage(self._canvas, 1.0 / 255.0, swapRB=True))
 
         empty = (
             np.empty((0, 17, 2), dtype=np.float32),
@@ -599,10 +589,68 @@ class OpenVINOPoseBackend:
         kept = np.asarray(kept).reshape(-1)[:YOLO_MAX_DETECTIONS]
         keypoints = candidates[kept, 5:].reshape(-1, 17, 3)
         points = (keypoints[:, :, :2] - np.array((left, top), dtype=np.float32)) / ratio
-        # O Ultralytics prende keypoints fora do quadro na borda; o backend CUDA faz o mesmo.
+        # O Ultralytics prende keypoints fora do quadro na borda; aqui tambem.
         np.clip(points[:, :, 0], 0, width, out=points[:, :, 0])
         np.clip(points[:, :, 1], 0, height, out=points[:, :, 1])
         return points, keypoints[:, :, 2]
+
+
+class OpenVINOPoseBackend(LetterboxPoseBackend):
+    """Runs an exported YOLO pose model on OpenVINO without Ultralytics overhead."""
+
+    def __init__(self, model_dir: str) -> None:
+        import openvino as ov
+
+        xml_files = [name for name in os.listdir(model_dir) if name.endswith(".xml")]
+        if len(xml_files) != 1:
+            raise RuntimeError(f"Esperado um .xml em {model_dir}")
+        compiled = ov.Core().compile_model(
+            os.path.join(model_dir, xml_files[0]),
+            "CPU",
+            {"PERFORMANCE_HINT": "LATENCY"},
+        )
+        self._request = compiled.create_infer_request()
+        _, _, input_height, input_width = (int(size) for size in compiled.inputs[0].shape)
+        super().__init__((input_height, input_width))
+
+    def _infer(self, blob: np.ndarray) -> np.ndarray:
+        self._request.infer({0: blob})
+        return self._request.get_output_tensor(0).data[0]
+
+
+class CudaGraphPoseBackend(LetterboxPoseBackend):
+    """Replays the PyTorch pose network as one CUDA graph.
+
+    Launching each layer from Python costs more CPU than the GPU spends on yolov8n;
+    a captured graph replaces ~200 kernel launches with a single call.
+    """
+
+    def __init__(self, model, input_size: tuple[int, int] = YOLO_OPENVINO_INPUT) -> None:
+        import torch
+
+        super().__init__(input_size)
+        self._torch = torch
+        network = model.model.fuse().to("cuda").eval()
+        for parameter in network.parameters():
+            parameter.requires_grad_(False)
+        self._input = torch.zeros((1, 3, *input_size), device="cuda")
+        self._host_input = torch.zeros((1, 3, *input_size)).pin_memory()
+        with torch.inference_mode():
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(3):
+                    network(self._input)
+            torch.cuda.current_stream().wait_stream(warmup_stream)
+            self._graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._graph):
+                self._output = network(self._input)[0][0]
+
+    def _infer(self, blob: np.ndarray) -> np.ndarray:
+        self._host_input.numpy()[:] = blob
+        self._input.copy_(self._host_input, non_blocking=True)
+        self._graph.replay()
+        return self._output.cpu().numpy()
 
 
 class UltralyticsPoseBackend:
@@ -692,7 +740,7 @@ class VisionProcessor:
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._mog2 = None
         self._previous_gray: Optional[np.ndarray] = None
-        self._yolo: Optional[UltralyticsPoseBackend | OpenVINOPoseBackend] = None
+        self._yolo: Optional[UltralyticsPoseBackend | LetterboxPoseBackend] = None
         self._yolo_backend: Optional[str] = None
         if mode == "mog2":
             self._reset_mog2()
@@ -719,8 +767,16 @@ class VisionProcessor:
         if cuda_available and not nogpu:
             if int8:
                 print("Aviso: --int8 so vale para OpenVINO/CPU; use com --nogpu.", file=sys.stderr)
-            self._yolo = UltralyticsPoseBackend(YOLO(YOLO_PT_MODEL), device=0)
-            self._yolo_backend = "CUDA / NVIDIA GPU"
+            try:
+                self._yolo = CudaGraphPoseBackend(YOLO(YOLO_PT_MODEL))
+                self._yolo_backend = "CUDA Graph / NVIDIA GPU"
+            except Exception as exc:
+                print(
+                    f"Aviso: CUDA Graph indisponivel ({exc}); usando Ultralytics em CUDA.",
+                    file=sys.stderr,
+                )
+                self._yolo = UltralyticsPoseBackend(YOLO(YOLO_PT_MODEL), device=0)
+                self._yolo_backend = "CUDA / NVIDIA GPU"
             return
 
         try:
