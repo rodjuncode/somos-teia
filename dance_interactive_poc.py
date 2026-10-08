@@ -58,6 +58,9 @@ YOLO_DETECTION_CONFIDENCE = 0.25
 YOLO_NMS_IOU = 0.7
 DEFAULT_MAX_CONNECTIONS = 5
 EDGE_STYLES = ("line", "bezier")
+# Espessura das ligacoes YOLO: maxima com os nos colados, minima em --max-distance.
+MESH_MIN_THICKNESS = 1
+MESH_MAX_THICKNESS = 10
 # Pontos de controle Bezier, relativos a aresta a->b: posicao ao longo dela
 # (fracao do comprimento) e desvio perpendicular maximo (fracao do comprimento).
 BEZIER_CONTROL_SPANS = ((0.15, 0.45), (0.55, 0.85))
@@ -1132,9 +1135,12 @@ class VisionProcessor:
             if self.edge_style == "bezier"
             else None
         )
-        for edge_index, ((key_a, key_b), line_alpha) in enumerate(
-            self._mesh_connections.items()
-        ):
+        for edge_index, (key_a, key_b) in enumerate(self._mesh_connections):
+            # Brilho e espessura seguem a distancia atual entre os nos.
+            current_distance = math.dist(
+                coordinates[node_indices[key_a]], coordinates[node_indices[key_b]]
+            )
+            line_alpha = max(0.0, 1.0 - current_distance / self.max_distance)
             color_value = int(255 * line_alpha)
             line_color = (
                 color_value,
@@ -1142,12 +1148,9 @@ class VisionProcessor:
                 int(color_value * 0.45),
             )
             debug_color = tuple(int(channel * 0.85) for channel in line_color)
-            # O brilho fica o do nascimento; a espessura segue a distancia atual.
-            current_distance = math.dist(
-                coordinates[node_indices[key_a]], coordinates[node_indices[key_b]]
+            thickness = MESH_MIN_THICKNESS + round(
+                line_alpha * (MESH_MAX_THICKNESS - MESH_MIN_THICKNESS)
             )
-            current_alpha = max(0.0, 1.0 - current_distance / self.max_distance)
-            thickness = 1 + int(current_alpha * 2)
             if curves is not None:
                 curve = [curves[edge_index]]
                 cv2.polylines(body, curve, False, line_color, thickness, cv2.LINE_AA)
