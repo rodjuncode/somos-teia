@@ -22,6 +22,7 @@ O modo Kinect usa profundidade em milimetros (DEPTH_MM).
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 import os
 import sys
@@ -741,6 +742,8 @@ class VisionProcessor:
         self._mog2 = None
         self._previous_gray: Optional[np.ndarray] = None
         self._yolo: Optional[UltralyticsPoseBackend | LetterboxPoseBackend] = None
+        # Inferencia que satura a CPU (OpenVINO ou PyTorch CPU).
+        self.cpu_inference = False
         self._yolo_backend: Optional[str] = None
         if mode == "mog2":
             self._reset_mog2()
@@ -800,6 +803,7 @@ class VisionProcessor:
         try:
             self._yolo = OpenVINOPoseBackend(model_dir)
             self._yolo_backend = "OpenVINO INT8 / CPU" if int8 else "OpenVINO / CPU"
+            self.cpu_inference = True
         except Exception as exc:
             self._load_yolo_cpu(YOLO, f"falha ao carregar OpenVINO: {exc}")
 
@@ -810,6 +814,7 @@ class VisionProcessor:
         )
         self._yolo = UltralyticsPoseBackend(yolo_class(YOLO_PT_MODEL), device="cpu")
         self._yolo_backend = "PyTorch CPU"
+        self.cpu_inference = True
 
     def _reset_mog2(self) -> None:
         self._mog2 = cv2.createBackgroundSubtractorMOG2(
@@ -1131,6 +1136,113 @@ def draw_debug_overlay(
         )
 
 
+def analyze_frame(
+    active_mode: str,
+    processor: Optional[VisionProcessor],
+    frame_bgr: np.ndarray,
+    body_mask: Optional[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Returns the (debug, body) images for one captured frame."""
+    if active_mode != "kinect":
+        result = processor.process(frame_bgr)
+        return result.debug_frame, result.body_frame
+    tinted = np.zeros_like(frame_bgr)
+    tinted[:, :, 1] = 200
+    overlay = cv2.bitwise_and(tinted, tinted, mask=body_mask)
+    debug = cv2.addWeighted(frame_bgr, 1.0, overlay, 0.28, 0.0)
+    contours, _ = cv2.findContours(body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(debug, contours, -1, (40, 230, 255), 1)
+    return debug, make_body_visual(body_mask)
+
+
+class ProcessingWorker:
+    """Processes the newest captured frame while the main thread drives the windows.
+
+    The Qt event loop (imshow/waitKey) costs a few ms per frame; running vision in
+    its own thread overlaps that with the next frame's inference.
+    """
+
+    def __init__(self, capturer: CaptureSource, analyze) -> None:
+        self._capturer = capturer
+        self._analyze = analyze
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._result: Optional[tuple[float, np.ndarray, np.ndarray]] = None
+        self._result_ready = threading.Event()
+        self.error: Optional[Exception] = None
+        self._thread = threading.Thread(
+            target=self._loop, name="vision-processing", daemon=True
+        )
+        self._thread.start()
+
+    def _loop(self) -> None:
+        last_timestamp: Optional[float] = None
+        try:
+            while not self._stop_event.is_set():
+                success, frame_bgr, _, body_mask = self._capturer.read()
+                timestamp = self._capturer.last_read_timestamp
+                if not success or frame_bgr is None or timestamp == last_timestamp:
+                    self._stop_event.wait(0.001)
+                    continue
+                last_timestamp = timestamp
+                debug, body = self._analyze(frame_bgr, body_mask)
+                with self._lock:
+                    self._result = (timestamp, debug, body)
+                self._result_ready.set()
+        except Exception as exc:
+            self.error = exc
+            self._result_ready.set()
+
+    def latest(
+        self, timeout: float = 0.0
+    ) -> Optional[tuple[float, np.ndarray, np.ndarray]]:
+        """Waits up to timeout for a new result; returns (timestamp, debug, body)."""
+        self._result_ready.wait(timeout)
+        self._result_ready.clear()
+        with self._lock:
+            return self._result
+
+    def close(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=5.0)
+        if self._thread.is_alive():
+            # Daemon: nao impede o encerramento, e a captura ainda precisa ser fechada.
+            print(
+                "Aviso: a thread de processamento nao encerrou em 5 segundos.",
+                file=sys.stderr,
+            )
+
+
+class InlineProcessing:
+    """ProcessingWorker interface that processes in the calling thread.
+
+    Used for CPU inference: overlapping the Qt repaint with OpenVINO on a saturated
+    CPU slowed each inference by ~6 ms (+8 ms latency) without raising the FPS.
+    """
+
+    error: Optional[Exception] = None
+
+    def __init__(self, capturer: CaptureSource, analyze) -> None:
+        self._capturer = capturer
+        self._analyze = analyze
+        self._last_timestamp: Optional[float] = None
+        self._result: Optional[tuple[float, np.ndarray, np.ndarray]] = None
+
+    def latest(
+        self, timeout: float = 0.0
+    ) -> Optional[tuple[float, np.ndarray, np.ndarray]]:
+        success, frame_bgr, _, body_mask = self._capturer.read()
+        timestamp = self._capturer.last_read_timestamp
+        if success and frame_bgr is not None and timestamp != self._last_timestamp:
+            self._last_timestamp = timestamp
+            debug, body = self._analyze(frame_bgr, body_mask)
+            self._result = (timestamp, debug, body)
+        return self._result
+
+    def close(self) -> None:
+        return
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PoC de danca interativa com captura e processamento 2D intercambiaveis.")
     parser.add_argument(
@@ -1277,38 +1389,30 @@ def main() -> int:
     recent_frame_times = deque(maxlen=30)
     last_latency_ms = 0.0
     last_processed_timestamp: Optional[float] = None
-    cached_images: Optional[tuple[np.ndarray, np.ndarray]] = None
+
+    def start_worker() -> ProcessingWorker | InlineProcessing:
+        worker_class = (
+            InlineProcessing
+            if processor is not None and processor.cpu_inference
+            else ProcessingWorker
+        )
+        return worker_class(
+            capturer, functools.partial(analyze_frame, active_mode, processor)
+        )
+
+    worker: Optional[ProcessingWorker | InlineProcessing] = start_worker()
     try:
         while True:
             if capturer.error is not None:
                 raise RuntimeError(f"Falha no backend de captura: {capturer.error}")
-            success, frame_bgr, _, body_mask = capturer.read()
-            if not success or frame_bgr is None:
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    break
-                continue
-
-            frame_start = capturer.last_read_timestamp
-            is_new_frame = frame_start != last_processed_timestamp
+            if worker.error is not None:
+                raise RuntimeError(f"Falha no processamento: {worker.error}") from worker.error
+            # Acorda assim que o worker publica, sem esperar o proximo waitKey.
+            latest = worker.latest(timeout=0.005)
+            is_new_frame = latest is not None and latest[0] != last_processed_timestamp
             if is_new_frame:
+                frame_start, debug, body = latest
                 recent_frame_times.append(frame_start)
-                if active_mode == "kinect":
-                    debug = frame_bgr
-                    tinted = np.zeros_like(debug)
-                    tinted[:, :, 1] = 200
-                    overlay = cv2.bitwise_and(tinted, tinted, mask=body_mask)
-                    debug = cv2.addWeighted(debug, 1.0, overlay, 0.28, 0.0)
-                    contours, _ = cv2.findContours(
-                        body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                    )
-                    cv2.drawContours(debug, contours, -1, (40, 230, 255), 1)
-                    vision_result = None
-                else:
-                    vision_result = processor.process(frame_bgr)
-                    body_mask = vision_result.body_mask
-                    debug = vision_result.debug_frame
-
                 fps = (
                     (len(recent_frame_times) - 1)
                     / (recent_frame_times[-1] - recent_frame_times[0])
@@ -1330,27 +1434,18 @@ def main() -> int:
                     depth_range,
                     capturer.background_active if active_mode == "kinect" else False,
                 )
-                body = (
-                    vision_result.body_frame
-                    if vision_result is not None
-                    else make_body_visual(body_mask)
-                )
-                cached_images = (debug, body)
-                last_processed_timestamp = frame_start
-
-            if cached_images is None:
-                cv2.waitKey(1)
-                continue
-            # O Qt mantem a ultima imagem; reenviar o mesmo frame so gasta CPU.
-            if is_new_frame:
-                for window, image in zip(windows, cached_images):
+                # O Qt mantem a ultima imagem; so frames novos sao enviados.
+                for window, image in zip(windows, (debug, body)):
                     cv2.imshow(window, image)
+                last_processed_timestamp = frame_start
             key = cv2.waitKey(1) & 0xFF
             if is_new_frame:
                 last_latency_ms = (time.perf_counter() - frame_start) * 1000.0
             if key == ord("q"):
                 break
             if key == ord("m"):
+                worker.close()
+                worker = None
                 previous = capturer
                 previous_key = previous.source_key
                 next_index = (source_choices.index(previous_key) + 1) % len(source_choices)
@@ -1387,6 +1482,7 @@ def main() -> int:
                         )
                     except Exception as exc:
                         print(f"Falha ao trocar para {next_key}: {exc}", file=sys.stderr)
+                        worker = start_worker()
                         continue
                     previous.close()
                     capturer = replacement
@@ -1409,7 +1505,7 @@ def main() -> int:
                     recent_frame_times.clear()
                     last_latency_ms = 0.0
                     last_processed_timestamp = None
-                    cached_images = None
+                    worker = start_worker()
                 continue
             if capturer is None:
                 break
@@ -1433,6 +1529,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nInterrompido pelo usuario; encerrando captura...", file=sys.stderr)
     finally:
+        if worker is not None:
+            worker.close()
         if capturer is not None:
             capturer.close()
         cv2.destroyAllWindows()

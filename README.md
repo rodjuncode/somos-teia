@@ -6,10 +6,11 @@ Prova de conceito em Python para explorar visuais generativos dirigidos pelo mov
 
 O protótipo em [`dance_interactive_poc.py`](dance_interactive_poc.py) já implementa:
 
-- Captura contínua em thread separada, mantendo o frame mais recente disponível para o loop visual.
+- Captura contínua em thread separada, mantendo o frame mais recente disponível.
+- Processamento visual (YOLO, MOG2, Farneback ou máscara Kinect) em outra thread: enquanto um frame é exibido, o seguinte já está sendo processado. A thread principal só desenha o overlay, atualiza as janelas e lê o teclado.
 - Três fontes intercambiáveis pela CLI e pela tecla `m`: Kinect v1, webcam USB e arquivo MP4/MOV em loop.
 - Fallback automático de Kinect para webcam e, opcionalmente, arquivo de vídeo.
-- Saída padronizada de todos os capturadores: sucesso, frame RGB, profundidade real ou matriz dummy e máscara corporal.
+- Saída padronizada de todos os capturadores: sucesso, frame BGR (formato nativo do OpenCV), profundidade e máscara corporal; webcam e vídeo devolvem `None` nesses dois últimos.
 - Webcam e vídeo usam modos selecionáveis: MOG2, fluxo óptico Farneback ou YOLOv8n-pose. O padrão é MOG2, sem inferência de IA.
 - Modo Kinect mantém profundidade RAW; se a inicialização falhar, o fallback usa MOG2 na webcam/vídeo.
 - Máscara binária por faixa de profundidade no Kinect, configurada inicialmente entre 800 e 3000 mm (ajustável por linha de comando e por atalhos).
@@ -17,7 +18,7 @@ O protótipo em [`dance_interactive_poc.py`](dance_interactive_poc.py) já imple
 - Duas janelas OpenCV neste momento: debug e projetor Corpo/Frontal. As telas de Chão/Fundo e Simulação/Consolidada e todo o cálculo associado estão temporariamente removidos.
 - Encerramento de captura e janelas ao pressionar `q`.
 
-O código compila e MOG2, Farneback e YOLO foram verificados com quadros sintéticos; YOLO real/model weights e execução ponta a ponta nos projetores ainda não foram validados nesta revisão. As metas de latência são objetivos por algoritmo, não garantias ponta a ponta.
+Os modos YOLO (CUDA e OpenVINO), MOG2, Farneback e Kinect foram executados de ponta a ponta com os vídeos de ensaio e o Kinect v1 conectado; os backends YOLO diretos produzem keypoints idênticos aos do Ultralytics. A exibição nos projetores reais ainda não foi validada. As metas de latência são objetivos por algoritmo, não garantias ponta a ponta.
 
 ## Requisitos
 
@@ -98,13 +99,13 @@ No Kinect, os atalhos alteram a faixa em passos de 100 mm:
 | `x` | Aumenta o limite máximo |
 | `b` | Captura/recria o fundo; faça isso com a área de dança vazia |
 
-Esses ajustes só se aplicam ao Kinect. Em webcam/vídeo, o mapa de profundidade é uma matriz zerada e o algoritmo escolhido produz `body_mask`.
+Esses ajustes só se aplicam ao Kinect. Em webcam/vídeo não há mapa de profundidade; o algoritmo escolhido produz a imagem do corpo.
 
 **Calibração do fundo Kinect:** ao pressionar `b`, a PoC registra a mediana de 15 frames (cerca de 0,5 s) como fundo estático. A máscara passa a incluir somente pixels dentro de `Min Depth`–`Max Depth` que estejam pelo menos 80 mm mais próximos que o fundo capturado. A parede fica fora da máscara e o dançarino, entre a câmera e a parede, aparece. O overlay mostra `Fundo: calibrado` quando ativo. Faça a captura sem pessoas na área e repita se mover a câmera, a parede ou objetos grandes; se o dançarino estiver presente durante a calibração, ele será tratado como fundo e sumirá da máscara.
 
 Sem calibrar o fundo, a máscara continua sendo apenas um corte por distância e **tudo** dentro da faixa aparece, incluindo parede, chão e móveis. O mapa usa `0` para "sem leitura"; nesta unidade, leituras válidas foram observadas desde ~410 mm. A "sombra" junto ao corpo vem da oclusão do padrão infravermelho do Kinect; pixels sem leitura continuam fora da máscara. A diferença de 80 mm pode ser insuficiente para superfícies que se moveram pouco, ou excessiva para partes muito finas do corpo; os limites Min/Max continuam sendo aplicados.
 
-Todos os capturadores entregam ao loop principal `(success, frame_rgb, depth_or_dummy, body_mask)`. Webcam e vídeo preenchem `depth_or_dummy` com zeros; o algoritmo selecionado produz a máscara. `Ctrl+C` também solicita o encerramento.
+Todos os capturadores entregam `(success, frame_bgr, depth, body_mask)`. Webcam e vídeo devolvem `None` em `depth` e `body_mask`; o algoritmo selecionado produz a máscara. O vídeo é decodificado com 2 threads do FFmpeg, que bastam para 720p60 e deixam núcleos livres para a inferência. `Ctrl+C` também solicita o encerramento.
 
 ## Janelas e telemetria
 
