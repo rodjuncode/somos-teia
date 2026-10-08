@@ -471,105 +471,6 @@ class VisionResult:
     body_frame: np.ndarray
 
 
-@dataclass(slots=True)
-class _QuadNode:
-    bounds: tuple[float, float, float, float]
-    indices: Optional[tuple[int, ...]] = None
-    children: Optional[tuple[Optional["_QuadNode"], ...]] = None
-
-
-class PointQuadTree:
-    """Spatial index used to find only node pairs near each other."""
-
-    LEAF_CAPACITY = 8
-    MAX_DEPTH = 12
-
-    def __init__(self, coordinates: np.ndarray) -> None:
-        self.coordinates = coordinates
-        minimum = coordinates.min(axis=0).astype(np.float64)
-        maximum = coordinates.max(axis=0).astype(np.float64)
-        for axis in range(2):
-            if maximum[axis] - minimum[axis] < 1.0:
-                minimum[axis] -= 0.5
-                maximum[axis] += 0.5
-        self._root = self._build(
-            tuple(range(len(coordinates))),
-            (minimum[0], minimum[1], maximum[0], maximum[1]),
-            0,
-        )
-
-    def _build(
-        self,
-        indices: tuple[int, ...],
-        bounds: tuple[float, float, float, float],
-        depth: int,
-    ) -> _QuadNode:
-        if len(indices) <= self.LEAF_CAPACITY or depth >= self.MAX_DEPTH:
-            return _QuadNode(bounds, indices=indices)
-
-        min_x, min_y, max_x, max_y = bounds
-        mid_x = (min_x + max_x) * 0.5
-        mid_y = (min_y + max_y) * 0.5
-        buckets: list[list[int]] = [[], [], [], []]
-        for index in indices:
-            x, y = self.coordinates[index]
-            quadrant = int(x >= mid_x) + 2 * int(y >= mid_y)
-            buckets[quadrant].append(index)
-        if max(map(len, buckets)) == len(indices):
-            return _QuadNode(bounds, indices=indices)
-
-        child_bounds = (
-            (min_x, min_y, mid_x, mid_y),
-            (mid_x, min_y, max_x, mid_y),
-            (min_x, mid_y, mid_x, max_y),
-            (mid_x, mid_y, max_x, max_y),
-        )
-        children = tuple(
-            self._build(tuple(bucket), child_bounds[index], depth + 1) if bucket else None
-            for index, bucket in enumerate(buckets)
-        )
-        return _QuadNode(bounds, children=children)
-
-    @staticmethod
-    def _intersects_radius(
-        bounds: tuple[float, float, float, float],
-        point: np.ndarray,
-        radius_squared: float,
-    ) -> bool:
-        min_x, min_y, max_x, max_y = bounds
-        dx = max(min_x - point[0], 0.0, point[0] - max_x)
-        dy = max(min_y - point[1], 0.0, point[1] - max_y)
-        return dx * dx + dy * dy <= radius_squared
-
-    def _query(
-        self,
-        node: Optional[_QuadNode],
-        point: np.ndarray,
-        radius_squared: float,
-        found: list[int],
-    ) -> None:
-        if node is None or not self._intersects_radius(node.bounds, point, radius_squared):
-            return
-        if node.indices is not None:
-            found.extend(node.indices)
-            return
-        for child in node.children or ():
-            self._query(child, point, radius_squared, found)
-
-    def candidate_pairs(self, radius: float) -> tuple[np.ndarray, np.ndarray]:
-        first: list[int] = []
-        second: list[int] = []
-        radius_squared = radius * radius
-        for node_index, point in enumerate(self.coordinates):
-            nearby: list[int] = []
-            self._query(self._root, point, radius_squared, nearby)
-            for other_index in nearby:
-                if other_index > node_index:
-                    first.append(node_index)
-                    second.append(other_index)
-        return np.asarray(first, dtype=np.intp), np.asarray(second, dtype=np.intp)
-
-
 class PresentationDeadband:
     def __init__(self, threshold_px: float = 4.0) -> None:
         if threshold_px < 0:
@@ -860,44 +761,47 @@ class VisionProcessor:
         degrees: Optional[np.ndarray] = None,
         connected: frozenset[tuple[int, int]] = frozenset(),
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if len(coordinates) < 2:
-            empty = np.empty(0, dtype=np.intp)
+        """Greedily links the closest pairs among nodes that still have free slots."""
+        empty = np.empty(0, dtype=np.intp)
+        if degrees is None:
+            degrees = np.zeros(len(coordinates), dtype=np.int32)
+        else:
+            degrees = degrees.astype(np.int32, copy=True)
+        free_nodes = np.flatnonzero(degrees < max_connections)
+        if free_nodes.size < 2:
             return empty, empty, np.empty(0, dtype=np.float32)
 
-        first, second = PointQuadTree(coordinates).candidate_pairs(max_distance)
-        if first.size == 0:
-            return first, second, np.empty(0, dtype=np.float32)
+        # Com no maximo algumas centenas de nos, todos os pares vetorizados em NumPy
+        # custam menos que qualquer indice espacial em Python.
+        pair_a, pair_b = np.triu_indices(free_nodes.size, 1)
+        first, second = free_nodes[pair_a], free_nodes[pair_b]
         deltas = coordinates[first] - coordinates[second]
         squared_distances = np.einsum("ij,ij->i", deltas, deltas)
         candidates = squared_distances < max_distance * max_distance
         first, second = first[candidates], second[candidates]
         squared_distances = squared_distances[candidates]
-        order = np.argsort(squared_distances, kind="stable")
-        if degrees is None:
-            degrees = np.zeros(len(coordinates), dtype=np.int32)
-        else:
-            degrees = degrees.astype(np.int32, copy=True)
-        selected = []
-        saturated_nodes = int(np.count_nonzero(degrees >= max_connections))
-        if saturated_nodes == len(degrees):
-            empty = np.empty(0, dtype=np.intp)
+        if first.size == 0:
             return empty, empty, np.empty(0, dtype=np.float32)
+        order = np.argsort(squared_distances, kind="stable")
+        first_list, second_list = first[order].tolist(), second[order].tolist()
+        degree_list = degrees.tolist()
+        free_count = free_nodes.size
+        selected = []
 
-        for edge_index in order:
-            node_a, node_b = int(first[edge_index]), int(second[edge_index])
-            if degrees[node_a] >= max_connections or degrees[node_b] >= max_connections:
+        for position, (node_a, node_b) in enumerate(zip(first_list, second_list)):
+            if degree_list[node_a] >= max_connections or degree_list[node_b] >= max_connections:
                 continue
             if (node_a, node_b) in connected:
                 continue
-            degrees[node_a] += 1
-            degrees[node_b] += 1
-            saturated_nodes += int(degrees[node_a] == max_connections)
-            saturated_nodes += int(degrees[node_b] == max_connections)
-            selected.append(edge_index)
-            if saturated_nodes == len(degrees):
+            degree_list[node_a] += 1
+            degree_list[node_b] += 1
+            free_count -= int(degree_list[node_a] == max_connections)
+            free_count -= int(degree_list[node_b] == max_connections)
+            selected.append(position)
+            if free_count < 2:
                 break
 
-        selected = np.asarray(selected, dtype=np.intp)
+        selected = order[np.asarray(selected, dtype=np.intp)]
         return (
             first[selected],
             second[selected],
