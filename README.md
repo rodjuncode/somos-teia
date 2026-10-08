@@ -120,7 +120,7 @@ O indicador usa verde até 35 ms, amarelo acima de 35 até 45 ms e vermelho acim
 
 ## Desempenho medido
 
-Comparação entre `v0.17.1` e `v0.18.2`, no PC de desenvolvimento (Intel 4 núcleos/8 threads, RTX 3060), alternando as versões e esperando a CPU esfriar entre execuções de 15 s; médias de 2 rodadas. `MVI_1741.MOV` é 720p a 60 fps com ~6 pessoas por quadro; o Kinect entrega 640×480 a 30 fps, que limita o FPS. Latência = mediana do tempo entre a captura e o fim do `waitKey`.
+Comparação entre `v0.17.1` e `v0.18.2`, no PC de desenvolvimento (Intel 4 núcleos/8 threads, RTX 3060), alternando as versões e esperando a CPU esfriar entre execuções de 15 s; médias de 2 rodadas. `videos/MVI_1741.MOV` é 720p a 60 fps com ~6 pessoas por quadro; o Kinect entrega 640×480 a 30 fps, que limita o FPS. Latência = mediana do tempo entre a captura e o fim do `waitKey`.
 
 | Modo | v0.17.1 | v0.18.2 |
 | --- | --- | --- |
@@ -129,7 +129,7 @@ Comparação entre `v0.17.1` e `v0.18.2`, no PC de desenvolvimento (Intel 4 núc
 | YOLO `--nogpu` INT8 (padrão desde v0.19.0), vídeo | — | 23,5 fps · 49 ms |
 | YOLO CUDA, Kinect | 30 fps · 23 ms | 30 fps · 14 ms |
 | YOLO `--nogpu` FP32, Kinect | 21,8 fps · 58 ms | 27,4 fps · 28 ms |
-| MOG2, vídeo (`MVI_1724.MOV`) | 36,0 fps · 37 ms | 47,9 fps · 30 ms |
+| MOG2, vídeo (`videos/MVI_1724.MOV`) | 36,0 fps · 37 ms | 47,9 fps · 30 ms |
 | Kinect (profundidade) | 30 fps · 9 ms | 30 fps · 16 ms |
 
 No modo Kinect puro, a latência medida subiu porque a v0.17.1 reenviava a mesma imagem ao Qt continuamente (≈15 `imshow` por frame, um núcleo inteiro ocupado); manter esse reenvio baixa o número medido para ~9 ms, mas piora o YOLO e não há como saber, sem medir a projeção, se a imagem aparece antes. A decisão final depende de uma medição física (roadmap, item 2).
