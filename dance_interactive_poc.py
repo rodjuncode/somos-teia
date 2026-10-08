@@ -44,7 +44,8 @@ BACKGROUND_DIFF_MM = 80
 YOLO_PT_MODEL = "yolov8n-pose.pt"
 YOLO_OPENVINO_MODEL = "yolov8n-pose_openvino_model"
 DEFAULT_MAX_CONNECTIONS = 5
-FrameData = tuple[np.ndarray, np.ndarray, np.ndarray]
+# (frame BGR, profundidade, mascara); fontes 2D nao tem profundidade nem mascara.
+FrameData = tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]
 CaptureResult = tuple[
     bool,
     Optional[np.ndarray],
@@ -157,8 +158,9 @@ class KinectV1Capturer:
                 depth, _ = depth_packet
                 rgb, _ = video_packet
                 # O array do driver e liberado em sync_stop(); copiar evita acesso a memoria invalida.
+                # cvtColor ja grava o RGB convertido em um array novo.
                 depth = np.array(depth, copy=True)
-                rgb = np.array(rgb, copy=True)
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
                 with self._lock:
                     min_depth, max_depth = self._min_depth, self._max_depth
@@ -167,7 +169,7 @@ class KinectV1Capturer:
                     depth, min_depth, max_depth, background_depth
                 )
                 with self._lock:
-                    self._frame = (rgb, depth, body_mask)
+                    self._frame = (bgr, depth, body_mask)
                     self._frame_captured_at = time.perf_counter()
                 self._ready_event.set()
         except Exception as exc:
@@ -283,11 +285,8 @@ class WebcamCapturer:
                 if not ok:
                     raise RuntimeError("Falha ao ler frame da webcam")
                 captured_at = time.perf_counter()
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
-                depth = np.zeros(mask.shape, dtype=np.uint16)
                 with self._lock:
-                    self._frame = (rgb, depth, mask)
+                    self._frame = (bgr, None, None)
                     self._frame_captured_at = captured_at
         except Exception as exc:
             self.error = exc
@@ -372,11 +371,8 @@ class VideoCapturer:
                         raise RuntimeError(f"O arquivo de video esta vazio: {self.path}")
 
                 captured_at = time.perf_counter()
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
-                depth = np.zeros(mask.shape, dtype=np.uint16)
                 with self._lock:
-                    self._frame = (rgb, depth, mask)
+                    self._frame = (bgr, None, None)
                     self._frame_captured_at = captured_at
 
                 next_frame_at += self._frame_period
@@ -615,7 +611,7 @@ def export_yolo_openvino_model(yolo_class=None) -> str:
 
 
 class VisionProcessor:
-    """Runs one selected 2D algorithm on each new RGB frame."""
+    """Runs one selected 2D algorithm on each new BGR frame."""
 
     MODE_LABELS = {
         "mog2": "MOG2 (Subtracao de Fundo)",
@@ -750,19 +746,19 @@ class VisionProcessor:
         mask = np.zeros((height, width), dtype=np.uint8)
         return VisionResult(mask, frame_bgr.copy(), np.zeros_like(frame_bgr))
 
-    def process(self, frame_rgb: np.ndarray) -> VisionResult:
+    def process(self, frame_bgr: np.ndarray) -> VisionResult:
         if self.mode == "mog2":
-            height, width = frame_rgb.shape[:2]
+            height, width = frame_bgr.shape[:2]
             size = (
                 max(1, int(width * self.MOG2_SCALE)),
                 max(1, int(height * self.MOG2_SCALE)),
             )
-            small_rgb = cv2.resize(frame_rgb, size, interpolation=cv2.INTER_AREA)
-            small_mask = self._clean_mask(self._mog2.apply(small_rgb))
+            small_bgr = cv2.resize(frame_bgr, size, interpolation=cv2.INTER_AREA)
+            small_mask = self._clean_mask(self._mog2.apply(small_bgr))
             mask = cv2.resize(
                 small_mask, (width, height), interpolation=cv2.INTER_NEAREST
             )
-            debug = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            debug = frame_bgr.copy()
             contours, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
@@ -770,7 +766,7 @@ class VisionProcessor:
             return VisionResult(mask, debug, make_body_visual(mask))
 
         if self.mode == "optical_flow":
-            gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             small_gray = cv2.resize(
                 gray,
                 (
@@ -779,16 +775,16 @@ class VisionProcessor:
                 ),
                 interpolation=cv2.INTER_AREA,
             )
-            result = self._process_flow(frame_rgb, small_gray)
+            result = self._process_flow(frame_bgr, small_gray)
             self._previous_gray = small_gray
             return result
 
-        return self._process_yolo(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+        return self._process_yolo(frame_bgr)
 
-    def _process_flow(self, frame_rgb: np.ndarray, gray: np.ndarray) -> VisionResult:
-        height, width = frame_rgb.shape[:2]
+    def _process_flow(self, frame_bgr: np.ndarray, gray: np.ndarray) -> VisionResult:
+        height, width = frame_bgr.shape[:2]
         if self._previous_gray is None:
-            return self._empty_result(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+            return self._empty_result(frame_bgr)
         flow = cv2.calcOpticalFlowFarneback(
             self._previous_gray, gray, None, 0.5, 1, 5, 1, 5, 1.1, 0
         )
@@ -798,7 +794,7 @@ class VisionProcessor:
         mask = cv2.resize(
             small_mask, (width, height), interpolation=cv2.INTER_NEAREST
         )
-        debug = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        debug = frame_bgr.copy()
         body = np.zeros_like(debug)
         scale = 1.0 / self.FLOW_SCALE
         flow_height, flow_width = gray.shape
@@ -1181,8 +1177,8 @@ def main() -> int:
         while True:
             if capturer.error is not None:
                 raise RuntimeError(f"Falha no backend de captura: {capturer.error}")
-            success, frame_rgb, depth, body_mask = capturer.read()
-            if not success or frame_rgb is None or depth is None or body_mask is None:
+            success, frame_bgr, _, body_mask = capturer.read()
+            if not success or frame_bgr is None:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
@@ -1193,7 +1189,7 @@ def main() -> int:
             if is_new_frame:
                 recent_frame_times.append(frame_start)
                 if active_mode == "kinect":
-                    debug = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                    debug = frame_bgr
                     tinted = np.zeros_like(debug)
                     tinted[:, :, 1] = 200
                     overlay = cv2.bitwise_and(tinted, tinted, mask=body_mask)
@@ -1204,7 +1200,7 @@ def main() -> int:
                     cv2.drawContours(debug, contours, -1, (40, 230, 255), 1)
                     vision_result = None
                 else:
-                    vision_result = processor.process(frame_rgb)
+                    vision_result = processor.process(frame_bgr)
                     body_mask = vision_result.body_mask
                     debug = vision_result.debug_frame
 
