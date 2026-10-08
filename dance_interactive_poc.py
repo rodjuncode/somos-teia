@@ -655,6 +655,9 @@ class VisionProcessor:
         self.max_connections = max_connections
         self.show_points = show_points
         self._presentation_deadband = PresentationDeadband(point_deadband)
+        self._mesh_connections: dict[
+            tuple[tuple[int, int], tuple[int, int]], float
+        ] = {}
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._mog2 = None
         self._previous_gray: Optional[np.ndarray] = None
@@ -733,6 +736,7 @@ class VisionProcessor:
             self._previous_gray = None
         elif self.mode == "yolo":
             self._presentation_deadband.reset()
+            self._mesh_connections.clear()
 
     def _clean_mask(self, mask: np.ndarray) -> np.ndarray:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)
@@ -828,6 +832,8 @@ class VisionProcessor:
         coordinates: np.ndarray,
         max_distance: float,
         max_connections: int,
+        degrees: Optional[np.ndarray] = None,
+        connected: frozenset[tuple[int, int]] = frozenset(),
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if len(coordinates) < 2:
             empty = np.empty(0, dtype=np.intp)
@@ -842,13 +848,21 @@ class VisionProcessor:
         first, second = first[candidates], second[candidates]
         squared_distances = squared_distances[candidates]
         order = np.argsort(squared_distances, kind="stable")
-        degrees = np.zeros(len(coordinates), dtype=np.int32)
+        if degrees is None:
+            degrees = np.zeros(len(coordinates), dtype=np.int32)
+        else:
+            degrees = degrees.astype(np.int32, copy=True)
         selected = []
-        saturated_nodes = 0
+        saturated_nodes = int(np.count_nonzero(degrees >= max_connections))
+        if saturated_nodes == len(degrees):
+            empty = np.empty(0, dtype=np.intp)
+            return empty, empty, np.empty(0, dtype=np.float32)
 
         for edge_index in order:
             node_a, node_b = int(first[edge_index]), int(second[edge_index])
             if degrees[node_a] >= max_connections or degrees[node_b] >= max_connections:
+                continue
+            if (node_a, node_b) in connected:
                 continue
             degrees[node_a] += 1
             degrees[node_b] += 1
@@ -911,14 +925,34 @@ class VisionProcessor:
         body = np.zeros_like(frame_bgr)
         mask = np.zeros((height, width), dtype=np.uint8)
         nodes = list(stable_nodes.items())
+        self._mesh_connections = {
+            edge: alpha
+            for edge, alpha in self._mesh_connections.items()
+            if edge[0] in stable_nodes and edge[1] in stable_nodes
+        }
         if nodes:
             coordinates = np.asarray([position for _, position in nodes], dtype=np.float32)
+            node_indices = {key: index for index, (key, _) in enumerate(nodes)}
+            degrees = np.zeros(len(nodes), dtype=np.int32)
+            connected = set()
+            for key_a, key_b in self._mesh_connections:
+                index_a, index_b = node_indices[key_a], node_indices[key_b]
+                degrees[index_a] += 1
+                degrees[index_b] += 1
+                connected.add((min(index_a, index_b), max(index_a, index_b)))
             first, second, edge_distances = self._select_mesh_edges(
-                coordinates, self.max_distance, self.max_connections
+                coordinates,
+                self.max_distance,
+                self.max_connections,
+                degrees,
+                frozenset(connected),
             )
-
             for node_a, node_b, distance in zip(first, second, edge_distances):
-                line_alpha = 1.0 - float(distance) / self.max_distance
+                edge = (nodes[node_a][0], nodes[node_b][0])
+                self._mesh_connections[edge] = 1.0 - float(distance) / self.max_distance
+
+            for (key_a, key_b), line_alpha in self._mesh_connections.items():
+                node_a, node_b = node_indices[key_a], node_indices[key_b]
                 color_value = int(255 * line_alpha)
                 line_color = (
                     color_value,
