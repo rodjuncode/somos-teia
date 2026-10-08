@@ -49,6 +49,9 @@ YOLO_INPUT_SIZE = (240, 320)
 YOLO_MAX_DETECTIONS = 16
 YOLO_MIN_KEYPOINT_CONFIDENCE = 0.25
 DEFAULT_MAX_CONNECTIONS = 5
+# Medido em H.264 720p60: 2 threads decodificam em ~4 ms/frame com ~40% da CPU
+# gasta pelo padrao do FFmpeg (8 threads), deixando nucleos livres para a inferencia.
+VIDEO_DECODE_THREADS = 2
 # (frame BGR, profundidade, mascara); fontes 2D nao tem profundidade nem mascara.
 FrameData = tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]
 CaptureResult = tuple[
@@ -346,7 +349,12 @@ class VideoCapturer:
 
     def __init__(self, path: str) -> None:
         self.path = os.path.abspath(path)
-        self._capture = cv2.VideoCapture(self.path)
+        self._capture = cv2.VideoCapture(
+            self.path, cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, VIDEO_DECODE_THREADS]
+        )
+        if not self._capture.isOpened():
+            self._capture.release()
+            self._capture = cv2.VideoCapture(self.path)
         if not self._capture.isOpened():
             self._capture.release()
             raise RuntimeError(f"Nao foi possivel abrir o video: {self.path}")
