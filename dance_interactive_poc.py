@@ -43,11 +43,18 @@ DEPTH_STEP_MM = 100
 BACKGROUND_SAMPLE_COUNT = 15
 BACKGROUND_DIFF_MM = 80
 YOLO_PT_MODEL = "yolov8n-pose.pt"
-YOLO_OPENVINO_MODEL = "yolov8n-pose_openvino_model"
+# Modelos OpenVINO retangulares: 320x240 recebe so 16 linhas de borda, nao 80.
+YOLO_OPENVINO_INPUT = (256, 320)
+YOLO_OPENVINO_MODEL = "yolov8n-pose_256x320_openvino_model"
+YOLO_OPENVINO_INT8_MODEL = "yolov8n-pose_256x320_int8_openvino_model"
+YOLO_INT8_CALIBRATION_DATA = "coco8-pose.yaml"
 # Entrada do YOLO (altura, largura) e limite de pessoas por frame.
 YOLO_INPUT_SIZE = (240, 320)
 YOLO_MAX_DETECTIONS = 16
 YOLO_MIN_KEYPOINT_CONFIDENCE = 0.25
+# Mesmos limiares padrao do Ultralytics para deteccao de pessoas.
+YOLO_DETECTION_CONFIDENCE = 0.25
+YOLO_NMS_IOU = 0.7
 DEFAULT_MAX_CONNECTIONS = 5
 # Medido em H.264 720p60: 2 threads decodificam em ~4 ms/frame com ~40% da CPU
 # gasta pelo padrao do FFmpeg (8 threads), deixando nucleos livres para a inferencia.
@@ -510,16 +517,92 @@ class PresentationDeadband:
         return stabilized
 
 
-def export_yolo_openvino_model(yolo_class=None) -> str:
-    if os.path.isdir(YOLO_OPENVINO_MODEL):
-        return YOLO_OPENVINO_MODEL
+def export_yolo_openvino_model(
+    yolo_class=None, int8: bool = False, calibration_data: Optional[str] = None
+) -> str:
+    target = YOLO_OPENVINO_INT8_MODEL if int8 else YOLO_OPENVINO_MODEL
+    if os.path.isdir(target):
+        return target
     if yolo_class is None:
         from ultralytics import YOLO as yolo_class
     model = yolo_class(YOLO_PT_MODEL)
-    model.export(format="openvino", imgsz=320)
-    if not os.path.isdir(YOLO_OPENVINO_MODEL):
-        raise RuntimeError(f"A exportacao nao criou {YOLO_OPENVINO_MODEL}")
-    return YOLO_OPENVINO_MODEL
+    options = (
+        {"quantize": 8, "data": calibration_data or YOLO_INT8_CALIBRATION_DATA}
+        if int8
+        else {}
+    )
+    exported = model.export(format="openvino", imgsz=YOLO_OPENVINO_INPUT, **options)
+    if not exported or not os.path.isdir(exported):
+        raise RuntimeError(f"A exportacao nao criou {target}")
+    os.replace(exported, target)
+    return target
+
+
+class OpenVINOPoseBackend:
+    """Runs an exported YOLO pose model on OpenVINO without Ultralytics overhead."""
+
+    def __init__(self, model_dir: str) -> None:
+        import openvino as ov
+
+        xml_files = [name for name in os.listdir(model_dir) if name.endswith(".xml")]
+        if len(xml_files) != 1:
+            raise RuntimeError(f"Esperado um .xml em {model_dir}")
+        compiled = ov.Core().compile_model(
+            os.path.join(model_dir, xml_files[0]),
+            "CPU",
+            {"PERFORMANCE_HINT": "LATENCY"},
+        )
+        self._request = compiled.create_infer_request()
+        _, _, input_height, input_width = (int(size) for size in compiled.inputs[0].shape)
+        self._input_size = (input_height, input_width)
+        self._canvas = np.full((input_height, input_width, 3), 114, dtype=np.uint8)
+
+    def keypoints(
+        self, frame_bgr: np.ndarray
+    ) -> tuple[np.ndarray, Optional[np.ndarray]]:
+        """Returns (people, 17, 2) image coordinates and (people, 17) confidences."""
+        height, width = frame_bgr.shape[:2]
+        input_height, input_width = self._input_size
+        # Letterbox centralizado, igual ao pre-processamento do Ultralytics.
+        ratio = min(input_height / height, input_width / width)
+        resized_width, resized_height = round(width * ratio), round(height * ratio)
+        if (resized_width, resized_height) != (width, height):
+            frame_bgr = cv2.resize(
+                frame_bgr, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR
+            )
+        top = round((input_height - resized_height) / 2 - 0.1)
+        left = round((input_width - resized_width) / 2 - 0.1)
+        self._canvas[:] = 114
+        self._canvas[top : top + resized_height, left : left + resized_width] = frame_bgr
+        blob = cv2.dnn.blobFromImage(self._canvas, 1.0 / 255.0, swapRB=True)
+        self._request.infer({0: blob})
+        output = self._request.get_output_tensor(0).data[0]
+
+        empty = (
+            np.empty((0, 17, 2), dtype=np.float32),
+            np.empty((0, 17), dtype=np.float32),
+        )
+        candidates = output[:, output[4] > YOLO_DETECTION_CONFIDENCE].T
+        if candidates.size == 0:
+            return empty
+        boxes = candidates[:, :4].copy()
+        boxes[:, :2] -= boxes[:, 2:] / 2
+        # top_k do OpenCV corta candidatos antes da supressao; o limite vem depois.
+        kept = cv2.dnn.NMSBoxes(
+            boxes.tolist(),
+            candidates[:, 4].tolist(),
+            YOLO_DETECTION_CONFIDENCE,
+            YOLO_NMS_IOU,
+        )
+        if len(kept) == 0:
+            return empty
+        kept = np.asarray(kept).reshape(-1)[:YOLO_MAX_DETECTIONS]
+        keypoints = candidates[kept, 5:].reshape(-1, 17, 3)
+        points = (keypoints[:, :, :2] - np.array((left, top), dtype=np.float32)) / ratio
+        # O Ultralytics prende keypoints fora do quadro na borda; o backend CUDA faz o mesmo.
+        np.clip(points[:, :, 0], 0, width, out=points[:, :, 0])
+        np.clip(points[:, :, 1], 0, height, out=points[:, :, 1])
+        return points, keypoints[:, :, 2]
 
 
 class UltralyticsPoseBackend:
@@ -590,6 +673,7 @@ class VisionProcessor:
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         point_deadband: float = 4.0,
         show_points: bool = False,
+        int8: bool = False,
     ) -> None:
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Modo 2D desconhecido: {mode}")
@@ -608,12 +692,12 @@ class VisionProcessor:
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._mog2 = None
         self._previous_gray: Optional[np.ndarray] = None
-        self._yolo: Optional[UltralyticsPoseBackend] = None
+        self._yolo: Optional[UltralyticsPoseBackend | OpenVINOPoseBackend] = None
         self._yolo_backend: Optional[str] = None
         if mode == "mog2":
             self._reset_mog2()
         elif mode == "yolo":
-            self._load_yolo(nogpu)
+            self._load_yolo(nogpu, int8)
 
     @property
     def label(self) -> str:
@@ -621,7 +705,7 @@ class VisionProcessor:
             return f"YOLOv8 Pose [{self._yolo_backend}]"
         return self.MODE_LABELS[self.mode]
 
-    def _load_yolo(self, nogpu: bool) -> None:
+    def _load_yolo(self, nogpu: bool, int8: bool = False) -> None:
         try:
             import torch
             from ultralytics import YOLO
@@ -633,6 +717,8 @@ class VisionProcessor:
 
         cuda_available = bool(torch.cuda.is_available())
         if cuda_available and not nogpu:
+            if int8:
+                print("Aviso: --int8 so vale para OpenVINO/CPU; use com --nogpu.", file=sys.stderr)
             self._yolo = UltralyticsPoseBackend(YOLO(YOLO_PT_MODEL), device=0)
             self._yolo_backend = "CUDA / NVIDIA GPU"
             return
@@ -643,20 +729,21 @@ class VisionProcessor:
             self._load_yolo_cpu(YOLO, "OpenVINO ausente")
             return
 
-        if not os.path.isdir(YOLO_OPENVINO_MODEL):
+        model_dir = YOLO_OPENVINO_INT8_MODEL if int8 else YOLO_OPENVINO_MODEL
+        if not os.path.isdir(model_dir):
             print(
-                f"Modelo OpenVINO ausente; exportando {YOLO_PT_MODEL} para CPU...",
+                f"Modelo OpenVINO ausente; exportando {YOLO_PT_MODEL} para {model_dir}...",
                 flush=True,
             )
             try:
-                export_yolo_openvino_model(YOLO)
+                export_yolo_openvino_model(YOLO, int8=int8)
             except Exception as exc:
                 self._load_yolo_cpu(YOLO, f"falha na exportacao OpenVINO: {exc}")
                 return
 
         try:
-            self._yolo = UltralyticsPoseBackend(YOLO(YOLO_OPENVINO_MODEL))
-            self._yolo_backend = "OpenVINO / CPU Intel"
+            self._yolo = OpenVINOPoseBackend(model_dir)
+            self._yolo_backend = "OpenVINO INT8 / CPU" if int8 else "OpenVINO / CPU"
         except Exception as exc:
             self._load_yolo_cpu(YOLO, f"falha ao carregar OpenVINO: {exc}")
 
@@ -1004,6 +1091,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="forca YOLO em OpenVINO/CPU ou PyTorch CPU em vez de CUDA",
     )
     parser.add_argument(
+        "--int8",
+        action="store_true",
+        help="com OpenVINO/CPU, usa o modelo quantizado INT8: ~40%% mais rapido, keypoints menos estaveis",
+    )
+    parser.add_argument(
         "--max-distance",
         type=float,
         default=150.0,
@@ -1062,6 +1154,7 @@ def make_vision_processor(
     max_connections: int = DEFAULT_MAX_CONNECTIONS,
     point_deadband: float = 4.0,
     show_points: bool = False,
+    int8: bool = False,
 ) -> Optional[VisionProcessor]:
     return (
         None
@@ -1073,6 +1166,7 @@ def make_vision_processor(
             max_connections=max_connections,
             point_deadband=point_deadband,
             show_points=show_points,
+            int8=int8,
         )
     )
 
@@ -1095,6 +1189,7 @@ def main() -> int:
             max_connections=args.max_connections,
             point_deadband=args.point_deadband,
             show_points=args.show_points,
+            int8=args.int8,
         )
     except Exception as exc:
         capturer.close()
@@ -1242,6 +1337,7 @@ def main() -> int:
                             max_connections=args.max_connections,
                             point_deadband=args.point_deadband,
                             show_points=args.show_points,
+                            int8=args.int8,
                         )
                     elif processor is not None:
                         processor.reset()
