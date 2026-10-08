@@ -7,7 +7,7 @@ Prova de conceito em Python para explorar visuais generativos dirigidos pelo mov
 O protótipo em [`dance_interactive_poc.py`](dance_interactive_poc.py) já implementa:
 
 - Captura contínua em thread separada, mantendo o frame mais recente disponível.
-- Processamento visual (YOLO, MOG2, Farneback ou máscara Kinect) em outra thread: enquanto um frame é exibido, o seguinte já está sendo processado. A thread principal só desenha o overlay, atualiza as janelas e lê o teclado.
+- Processamento visual (YOLO em CUDA, MOG2, Farneback ou máscara Kinect) em outra thread: enquanto um frame é exibido, o seguinte já está sendo processado, e a thread principal só desenha o overlay, atualiza as janelas e lê o teclado. Com inferência em CPU (OpenVINO ou PyTorch CPU), o processamento continua na thread principal: com a CPU saturada, sobrepor a pintura das janelas deixava cada inferência ~6 ms mais lenta sem aumentar o FPS.
 - Três fontes intercambiáveis pela CLI e pela tecla `m`: Kinect v1, webcam USB e arquivo MP4/MOV em loop.
 - Fallback automático de Kinect para webcam e, opcionalmente, arquivo de vídeo.
 - Saída padronizada de todos os capturadores: sucesso, frame BGR (formato nativo do OpenCV), profundidade e máscara corporal; webcam e vídeo devolvem `None` nesses dois últimos.
@@ -117,6 +117,24 @@ As janelas Chão/Fundo e Simulação/Consolidada estão temporariamente desativa
 A latência exibida é medida por `time.perf_counter()` desde o timestamp associado ao frame até o fim do ciclo de exibição/`waitKey`. É uma estimativa de software; não mede exposição do sensor, sincronização real dos projetores ou o tempo até o conteúdo aparecer fisicamente. Os timestamps de Kinect e webcam também não são equivalentes, portanto os resultados entre modos não devem ser comparados como uma medição calibrada.
 
 O indicador usa verde até 35 ms, amarelo acima de 35 até 45 ms e vermelho acima de 45 ms. O FPS representa a taxa observada pelo loop visual, não necessariamente a taxa nativa do sensor.
+
+## Desempenho medido
+
+Comparação entre `v0.17.1` e `v0.18.2`, no PC de desenvolvimento (Intel 4 núcleos/8 threads, RTX 3060), alternando as versões e esperando a CPU esfriar entre execuções de 15 s; médias de 2 rodadas. `MVI_1741.MOV` é 720p a 60 fps com ~6 pessoas por quadro; o Kinect entrega 640×480 a 30 fps, que limita o FPS. Latência = mediana do tempo entre a captura e o fim do `waitKey`.
+
+| Modo | v0.17.1 | v0.18.2 |
+| --- | --- | --- |
+| YOLO CUDA, vídeo | 18,0 fps · 58 ms | 53,3 fps · 18 ms |
+| YOLO `--nogpu`, vídeo | 8,3 fps · 127 ms | 13,6 fps · 78 ms |
+| YOLO `--nogpu --int8`, vídeo | — | 23,5 fps · 49 ms |
+| YOLO CUDA, Kinect | 30 fps · 23 ms | 30 fps · 14 ms |
+| YOLO `--nogpu`, Kinect | 21,8 fps · 58 ms | 27,4 fps · 28 ms |
+| MOG2, vídeo (`MVI_1724.MOV`) | 36,0 fps · 37 ms | 47,9 fps · 30 ms |
+| Kinect (profundidade) | 30 fps · 9 ms | 30 fps · 16 ms |
+
+No modo Kinect puro, a latência medida subiu porque a v0.17.1 reenviava a mesma imagem ao Qt continuamente (≈15 `imshow` por frame, um núcleo inteiro ocupado); manter esse reenvio baixa o número medido para ~9 ms, mas piora o YOLO e não há como saber, sem medir a projeção, se a imagem aparece antes. A decisão final depende de uma medição física (roadmap, item 2).
+
+**Atenção ao resfriamento:** neste PC a CPU fica em 77–88 °C em repouso e chega a 100 °C em poucos segundos de carga, quando o kernel passa a injetar pausas (`intel_powerclamp`, até 49% em todos os núcleos). Os modos que dependem da CPU (`--nogpu`, MOG2) variam 2–3× conforme a temperatura; compare versões sempre alternando execuções.
 
 ## Versionamento e commits
 
