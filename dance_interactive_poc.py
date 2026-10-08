@@ -1142,7 +1142,12 @@ class VisionProcessor:
                 int(color_value * 0.45),
             )
             debug_color = tuple(int(channel * 0.85) for channel in line_color)
-            thickness = 1 + int(line_alpha * 2)
+            # O brilho fica o do nascimento; a espessura segue a distancia atual.
+            current_distance = math.dist(
+                coordinates[node_indices[key_a]], coordinates[node_indices[key_b]]
+            )
+            current_alpha = max(0.0, 1.0 - current_distance / self.max_distance)
+            thickness = 1 + int(current_alpha * 2)
             if curves is not None:
                 curve = [curves[edge_index]]
                 cv2.polylines(body, curve, False, line_color, thickness, cv2.LINE_AA)
