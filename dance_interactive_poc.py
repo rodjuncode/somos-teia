@@ -622,8 +622,9 @@ class VisionProcessor:
         "optical_flow": "Optical Flow (Farneback)",
         "yolo": "YOLOv8n-pose",
     }
+    HEAD_NODE = 17
     NODE_GROUPS = (
-        (17, (0, 1, 2, 3, 4)),
+        (HEAD_NODE, (0, 1, 2, 3, 4)),
         (5, (5, 6)),
         (7, (7, 8)),
         (9, (9, 10)),
@@ -915,7 +916,11 @@ class VisionProcessor:
                     visible = indices[valid[indices]]
                     if visible.size == 0:
                         continue
-                    point = points[visible[0]]
+                    point = (
+                        points[visible].mean(axis=0)
+                        if node_class == self.HEAD_NODE
+                        else points[visible[0]]
+                    )
                     raw_nodes[(person_index, node_class)] = (
                         float(point[0]), float(point[1])
                     )
@@ -967,7 +972,7 @@ class VisionProcessor:
 
             for node_key, position in nodes:
                 point = tuple(np.rint(position).astype(int))
-                is_head = node_key[1] == 17
+                is_head = node_key[1] == self.HEAD_NODE
                 radius = 7 if is_head else 5
                 if self.show_points:
                     cv2.circle(body, point, radius + 3, (0, 55, 0), -1, cv2.LINE_AA)
