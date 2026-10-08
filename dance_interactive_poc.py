@@ -60,7 +60,10 @@ DEFAULT_MAX_CONNECTIONS = 5
 EDGE_STYLES = ("line", "bezier")
 # Espessura das ligacoes YOLO: maxima com os nos colados, minima em --max-distance.
 MESH_MIN_THICKNESS = 1
-MESH_MAX_THICKNESS = 10
+MESH_MAX_THICKNESS = 20
+# Brilho minimo das ligacoes (fracao do maximo), em --max-distance ou alem: na
+# projecao, linhas escuras quase nao aparecem.
+MESH_MIN_BRIGHTNESS = 0.5
 # Pontos de controle Bezier, relativos a aresta a->b: posicao ao longo dela
 # (fracao do comprimento) e desvio perpendicular maximo (fracao do comprimento).
 BEZIER_CONTROL_SPANS = ((0.15, 0.45), (0.55, 0.85))
@@ -1141,7 +1144,9 @@ class VisionProcessor:
                 coordinates[node_indices[key_a]], coordinates[node_indices[key_b]]
             )
             line_alpha = max(0.0, 1.0 - current_distance / self.max_distance)
-            color_value = int(255 * line_alpha)
+            color_value = int(
+                255 * (MESH_MIN_BRIGHTNESS + (1.0 - MESH_MIN_BRIGHTNESS) * line_alpha)
+            )
             line_color = (
                 color_value,
                 int(color_value * 0.78),
