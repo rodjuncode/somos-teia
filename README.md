@@ -135,7 +135,16 @@ Comparação entre `v0.17.1` e `v0.18.2`, no PC de desenvolvimento (Intel 4 núc
 
 No modo Kinect puro, a latência medida subiu porque a v0.17.1 reenviava a mesma imagem ao Qt continuamente (≈15 `imshow` por frame, um núcleo inteiro ocupado); manter esse reenvio baixa o número medido para ~9 ms, mas piora o YOLO e não há como saber, sem medir a projeção, se a imagem aparece antes. A decisão final depende de uma medição física (roadmap, item 2).
 
-**Atenção ao resfriamento:** neste PC a CPU fica em 77–88 °C em repouso e chega a 100 °C em poucos segundos de carga, quando o kernel passa a injetar pausas (`intel_powerclamp`, até 49% em todos os núcleos). Os modos que dependem da CPU (`--nogpu`, MOG2) variam 2–3× conforme a temperatura; compare versões sempre alternando execuções.
+**Resfriamento:** essas medições foram feitas com o cooler original da CPU com defeito — ela chegava a 100 °C em segundos e o kernel injetava pausas (`intel_powerclamp`, até 49% em todos os núcleos), o que limitava sobretudo os modos que dependem da CPU. Depois da troca do cooler (08/10/2026), 15 min em carga total estabilizam em 84–86 °C sem pausas, e os mesmos benchmarks (médias de 2 rodadas, sem Kinect conectado) ficaram assim:
+
+| Modo (vídeo) | v0.18.2, cooler antigo | v0.18.2, cooler novo | v0.23.0, cooler novo |
+| --- | --- | --- | --- |
+| YOLO CUDA | 53,3 fps · 18 ms | 59,9 fps · 17 ms | 59,9 fps · 17 ms |
+| YOLO `--nogpu` FP32 | 13,6 fps · 78 ms | 49,6 fps · 27 ms | 46,0 fps · 29 ms |
+| YOLO `--nogpu` INT8 | 23,5 fps · 49 ms | 54,6 fps · 26 ms | 53,0 fps · 26 ms |
+| MOG2 (`videos/MVI_1724.MOV`) | 47,9 fps · 30 ms | 59,9 fps · 12 ms | 59,9 fps · 12 ms |
+
+59,9 fps é o limite dos vídeos (60 fps). A pequena perda da v0.23.0 em CPU vem do desenho das linhas mais grossas (até 20 px).
 
 ## Versionamento e commits
 
