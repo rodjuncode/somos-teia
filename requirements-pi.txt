@@ -1,6 +1,6 @@
-# Raspberry Pi (--pi): o modo xadrez so precisa de NumPy e OpenCV (e sounddevice
-# para o metronomo opcional).
-# Ultralytics/PyTorch/OpenVINO (modo conexoes) nao sao necessarios.
+# Instalacao leve, sem YOLO: todos os modos menos conexoes. Usada no Raspberry Pi
+# (--pi) e serve tambem num notebook que nao vai usar o modo conexoes.
+# Ultralytics/PyTorch/OpenVINO (modo conexoes) ficam em requirements.txt.
 # Para o Kinect, instale tambem requirements-kinect.txt.
 numpy<2
 opencv-python==4.11.0.86

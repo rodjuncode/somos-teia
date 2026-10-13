@@ -1,3 +1,5 @@
+# Completo: todos os modos, inclusive conexoes (YOLO: ultralytics/PyTorch/OpenVINO).
+# Sem placa NVIDIA, instale antes o PyTorch so de CPU (veja 'Primeiros passos' no README).
 numpy<2
 opencv-python==4.11.0.86
 ultralytics

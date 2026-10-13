@@ -39,8 +39,22 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
-import cv2
-import numpy as np
+# Checado antes de tudo: em Python antigo o erro apareceria so mais abaixo, como
+# um TypeError obscuro em @dataclass(slots=True).
+if sys.version_info < (3, 10):
+    sys.exit(
+        f"Esta PoC precisa de Python 3.10 ou mais novo (encontrado {sys.version.split()[0]}). "
+        "No Raspberry Pi, use o Raspberry Pi OS Bookworm (Python 3.11)."
+    )
+try:
+    import cv2
+    import numpy as np
+except ImportError as exc:
+    sys.exit(
+        f"Pacote ausente: {exc.name or exc}. Ative o venv (source .venv/bin/activate) e instale "
+        "as dependencias: python -m pip install -r requirements.txt (notebook/desktop) ou "
+        "-r requirements-pi.txt (Raspberry Pi). Veja 'Primeiros passos' no README."
+    )
 
 # Medido: o 1o frame do Kinect v1 chega em ~7 s neste equipamento.
 KINECT_START_TIMEOUT = 20.0
@@ -50,11 +64,14 @@ DEFAULT_MAX_DEPTH_MM = 3000
 DEPTH_STEP_MM = 100
 BACKGROUND_SAMPLE_COUNT = 15
 BACKGROUND_DIFF_MM = 80
-YOLO_PT_MODEL = "yolov8n-pose.pt"
+# Arquivos do YOLO ficam ao lado deste script, nao no diretorio de onde ele e
+# chamado: assim rodar de outra pasta nao baixa nem exporta tudo de novo.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+YOLO_PT_MODEL = os.path.join(SCRIPT_DIR, "yolov8n-pose.pt")
 # Modelos OpenVINO retangulares: 320x240 recebe so 16 linhas de borda, nao 80.
 YOLO_OPENVINO_INPUT = (256, 320)
-YOLO_OPENVINO_MODEL = "yolov8n-pose_256x320_openvino_model"
-YOLO_OPENVINO_INT8_MODEL = "yolov8n-pose_256x320_int8_openvino_model"
+YOLO_OPENVINO_MODEL = os.path.join(SCRIPT_DIR, "yolov8n-pose_256x320_openvino_model")
+YOLO_OPENVINO_INT8_MODEL = os.path.join(SCRIPT_DIR, "yolov8n-pose_256x320_int8_openvino_model")
 YOLO_INT8_CALIBRATION_DATA = "coco8-pose.yaml"
 # Entrada do YOLO (altura, largura) e limite de pessoas por frame.
 YOLO_INPUT_SIZE = (240, 320)
@@ -291,7 +308,7 @@ MEADOW_TURN_PUSH = (1.0 - MEADOW_DAMPING) / 2.0
 # --image-anchor escolhe a faixa visivel (0 = topo, 0,5 = meio, 1 = base).
 # --image aceita uma pasta (todas as imagens, em ordem alfabetica; teclas a/z
 # alternam entre elas) ou um arquivo.
-LANDSCAPE_DEFAULT_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paisagens")
+LANDSCAPE_DEFAULT_IMAGE = os.path.join(SCRIPT_DIR, "paisagens")
 LANDSCAPE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 # a volta para a imagem anterior e z avanca para a proxima (o mesmo par das outras teclas).
 LANDSCAPE_IMAGE_KEYS = {ord("a"): -1, ord("z"): 1}
@@ -314,6 +331,22 @@ LANDSCAPE_BRISTLE = 0.8
 LANDSCAPE_BRISTLE_WIDTH = 2.0
 LANDSCAPE_BRISTLE_WIDTH_RANGE = (1.0, 16.0)
 LANDSCAPE_BRISTLE_KEYS = {ord("h"): -1.0, ord("n"): 1.0}
+# Paletas neon (estetica cyberpunk) por mapa de gradiente: o brilho de cada pixel
+# vira uma cor do gradiente, do escuro ao claro. E aplicado no desenho, nao na
+# tela guardada: trocar de paleta e instantaneo e mantem borrao, regeneracao e a
+# janela da silhueta. O brilho de cada pintura e esticado entre os percentis
+# LANDSCAPE_PALETTE_STRETCH para ocupar o gradiente todo (as pinturas sao escuras).
+# Tecla p alterna; "original" mostra as cores da pintura.
+LANDSCAPE_PALETTES: dict[str, Optional[tuple[str, ...]]] = {
+    "original": None,
+    "synthwave": ("#0d0221", "#2a0a4a", "#7b1fa2", "#ff2a6d", "#ff9e3d", "#fff5c0"),
+    "cyberpunk": ("#05020f", "#1b0b3b", "#5a189a", "#f107a3", "#00f0ff", "#fcee09"),
+    "matrix": ("#000000", "#001a06", "#00500f", "#00a82d", "#39ff6a", "#e0ffe8"),
+    "tron": ("#000306", "#04121f", "#0a3a5c", "#008cff", "#00e5ff", "#eaffff"),
+    "vaporwave": ("#140a2b", "#3d1d6b", "#ff71ce", "#b967ff", "#01cdfe", "#fffb96"),
+}
+LANDSCAPE_PALETTE_STRETCH = (2.0, 98.0)
+LANDSCAPE_PALETTE_KEY = ord("p")
 # Como calcular os mapas do remap: "opencv" (cv2.multiply/scaleAdd, ~20% mais
 # rapido em 720p) ou "numpy" (a versao original). O arredondamento do OpenCV
 # difere em ate ~1e-4 px; num ensaio de 400 quadros, 13 de 921 600 pixels
@@ -1714,6 +1747,10 @@ class LandscapeCanvas:
         self.index = index
         self.anchor = anchor
         self._original = fit_cover(image, width, height, anchor)
+        # Faixa de brilho da pintura, para esticar o gradiente das paletas neon.
+        gray = cv2.cvtColor(self._original, cv2.COLOR_BGR2GRAY)
+        low, high = np.percentile(gray, LANDSCAPE_PALETTE_STRETCH)
+        self.levels = (int(low), int(high))
         self._canvas = self._original.copy()
 
     def reset(self) -> None:
@@ -1946,6 +1983,7 @@ class VisionProcessor:
         landscape_regen_delay: float = LANDSCAPE_REGEN_DELAY,
         landscape_regen_time: float = LANDSCAPE_REGEN_TIME,
         landscape_bristle_width: float = LANDSCAPE_BRISTLE_WIDTH,
+        landscape_palette: str = "original",
         plaid_density: float = DEFAULT_PLAID_DENSITY,
         plaid_gain: float = DEFAULT_PLAID_GAIN,
         plaid_rotation: float = DEFAULT_PLAID_ROTATION,
@@ -2007,6 +2045,10 @@ class VisionProcessor:
         # thread principal; o worker so le o valor a cada quadro.
         self.landscape_gain = min(meadow_gain, LANDSCAPE_MAX_GAIN)
         self.landscape_bristle_width = landscape_bristle_width
+        if landscape_palette not in LANDSCAPE_PALETTES:
+            raise ValueError(f"Paleta desconhecida: {landscape_palette}")
+        self.landscape_palette = landscape_palette
+        self._palette_luts: dict[tuple[str, int, int], np.ndarray] = {}
         self.landscape_regen_delay = landscape_regen_delay
         self.landscape_regen_time = landscape_regen_time
         if not 0.0 <= landscape_anchor <= 1.0:
@@ -2099,10 +2141,33 @@ class VisionProcessor:
                     else ""
                 )
                 + (" | silhueta" if self.silhouette else "")
+                + f" | paleta {self.landscape_palette}"
                 + f" | feixe {self.landscape_bristle_width:.0f}px"
                 + f" | volta {self.landscape_regen_delay:.0f}s/{self.landscape_regen_time:.0f}s"
             )
         return self.MODE_LABELS[self.mode]
+
+    def switch_palette(self) -> None:
+        """Passa para a proxima paleta (a ultima volta para a original)."""
+        names = list(LANDSCAPE_PALETTES)
+        self.landscape_palette = names[(names.index(self.landscape_palette) + 1) % len(names)]
+
+    def _palette_lut(self, levels: tuple[int, int]) -> np.ndarray:
+        """Tabela (256, 1, 3) BGR da paleta atual, esticada na faixa da pintura."""
+        key = (self.landscape_palette, *levels)
+        if key not in self._palette_luts:
+            stops = np.array(
+                [hex_to_bgr(color) for color in LANDSCAPE_PALETTES[self.landscape_palette]],
+                np.float32,
+            )
+            low, high = levels
+            brightness = np.clip((np.arange(256) - low) / max(high - low, 1), 0.0, 1.0)
+            positions = np.linspace(0.0, 1.0, len(stops))
+            self._palette_luts[key] = np.stack(
+                [np.interp(brightness, positions, stops[:, channel]) for channel in range(3)],
+                axis=1,
+            ).astype(np.uint8)[:, None, :]
+        return self._palette_luts[key]
 
     def adjust_bristles(self, width_delta: float) -> None:
         """Afina ou engrossa os feixes do borrao; o worker refaz as cerdas."""
@@ -2165,10 +2230,17 @@ class VisionProcessor:
             from ultralytics import YOLO
         except ImportError as exc:
             raise RuntimeError(
-                "O modo YOLO requer ultralytics/PyTorch; instale com "
-                "python -m pip install -r requirements.txt"
+                "O modo conexoes (YOLO) requer ultralytics/PyTorch; instale com "
+                "python -m pip install -r requirements.txt (em CPU sem placa NVIDIA, veja no "
+                "README como instalar o PyTorch so de CPU, bem menor)"
             ) from exc
 
+        if not os.path.isfile(YOLO_PT_MODEL):
+            print(
+                f"Primeiro uso do modo conexoes: baixando {os.path.basename(YOLO_PT_MODEL)} "
+                f"(~7 MB) para {SCRIPT_DIR}; precisa de internet.",
+                flush=True,
+            )
         cuda_available = bool(torch.cuda.is_available())
         if cuda_available and not nogpu:
             if int8:
@@ -2200,7 +2272,15 @@ class VisionProcessor:
         for model_dir, quantized, label in variants:
             if not os.path.isdir(model_dir):
                 print(
-                    f"Modelo OpenVINO ausente; exportando {YOLO_PT_MODEL} para {model_dir}...",
+                    f"Primeiro uso em CPU: exportando o YOLO para OpenVINO"
+                    f"{' INT8' if quantized else ''} em {os.path.basename(model_dir)}. Leva "
+                    "alguns minutos"
+                    + (
+                        " e baixa um pequeno dataset de calibracao (precisa de internet)"
+                        if quantized
+                        else ""
+                    )
+                    + "; nas proximas execucoes o modelo ja estara pronto.",
                     flush=True,
                 )
                 try:
@@ -2486,6 +2566,10 @@ class VisionProcessor:
         self._field.draw(body)
         if self.mode == "paisagens" and self.silhouette:
             self._silhouette_window(body, frame_bgr, body_mask)
+        if self.mode == "paisagens" and self.landscape_palette != "original":
+            body = cv2.applyColorMap(
+                cv2.cvtColor(body, cv2.COLOR_BGR2GRAY), self._palette_lut(self._field.levels)
+            )
         # Desenhar uma vez e compor com max custa ~0,2 ms; redesenhar as linhas
         # anti-aliased no quadro de debug custaria outros ~3 ms.
         debug = cv2.max(frame_bgr, body) if self.render.debug_output else body
@@ -3211,6 +3295,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "recorte e sorteada a cada carga",
     )
     parser.add_argument(
+        "--palette",
+        choices=tuple(LANDSCAPE_PALETTES),
+        default="original",
+        help="paisagens: cores da pintura; original ou uma paleta neon de estetica "
+        "cyberpunk aplicada por mapa de gradiente (padrao: original; tecla p alterna)",
+    )
+    parser.add_argument(
         "--bristle-width",
         type=float,
         default=LANDSCAPE_BRISTLE_WIDTH,
@@ -3321,6 +3412,7 @@ def make_vision_processor(
     landscape_regen_delay: float = LANDSCAPE_REGEN_DELAY,
     landscape_regen_time: float = LANDSCAPE_REGEN_TIME,
     landscape_bristle_width: float = LANDSCAPE_BRISTLE_WIDTH,
+    landscape_palette: str = "original",
     plaid_density: float = DEFAULT_PLAID_DENSITY,
     plaid_gain: float = DEFAULT_PLAID_GAIN,
     plaid_rotation: float = DEFAULT_PLAID_ROTATION,
@@ -3352,6 +3444,7 @@ def make_vision_processor(
             landscape_regen_delay=landscape_regen_delay,
             landscape_regen_time=landscape_regen_time,
             landscape_bristle_width=landscape_bristle_width,
+            landscape_palette=landscape_palette,
             plaid_density=plaid_density,
             plaid_gain=plaid_gain,
             plaid_rotation=plaid_rotation,
@@ -3364,8 +3457,42 @@ def make_vision_processor(
     )
 
 
+# Teclas por modo, impressas na partida; q, m e as do metronomo valem sempre.
+COMMON_KEY_HELP = "q sai | m troca a fonte | t metronomo, - / = andamento"
+MODE_KEY_HELP = {
+    "kinect": "a/z profundidade minima | s/x maxima | b calibra o fundo (sala vazia)",
+    "xadrez": "a/z densidade | s/x ganho | d/c rotacao | f/v matiz | g silhueta | "
+    "l malha mix/regular | b fundo (Kinect)",
+    "paisagens": "a/z pintura | p paleta | s/x forca | h/n feixe | d/c espera da volta | "
+    "f/v tempo da volta | g silhueta | b fundo (Kinect)",
+}
+
+
+def print_key_help(mode: str) -> None:
+    print(f"Teclas (com a janela em foco): {COMMON_KEY_HELP}")
+    if mode in MODE_KEY_HELP:
+        print(f"Teclas do modo {mode}: {MODE_KEY_HELP[mode]}")
+
+
+def display_problem() -> Optional[str]:
+    """Motivo pelo qual as janelas do OpenCV nao vao abrir, ou None."""
+    # O OpenCV do pip abre janelas por Qt/X11 (xcb); no Wayland, pelo XWayland,
+    # que tambem define DISPLAY. Sem ele, o Qt aborta o processo com core dump.
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        return (
+            "Nenhuma tela grafica disponivel (variavel DISPLAY vazia). Rode a PoC no "
+            "terminal da propria sessao grafica do notebook/Raspberry Pi. Por SSH, com a "
+            "sessao grafica aberta e logada na maquina, use: export DISPLAY=:0"
+        )
+    return None
+
+
 def main() -> int:
     args = parse_args()
+    problem = display_problem()
+    if problem is not None:
+        print(f"Erro: {problem}", file=sys.stderr)
+        return 1
     try:
         capturer = create_capturer(
             args.source, args.min_depth, args.max_depth, args.fallback_video
@@ -3396,6 +3523,7 @@ def main() -> int:
             landscape_regen_delay=args.regen_delay,
             landscape_regen_time=args.regen_time,
             landscape_bristle_width=args.bristle_width,
+            landscape_palette=args.palette,
             plaid_density=args.density,
             plaid_gain=args.gain,
             plaid_rotation=args.rotation,
@@ -3437,6 +3565,7 @@ def main() -> int:
             capturer, functools.partial(analyze_frame, active_mode, processor)
         )
 
+    print_key_help(active_mode)
     worker: Optional[ProcessingWorker | InlineProcessing] = start_worker()
     try:
         while True:
@@ -3548,6 +3677,7 @@ def main() -> int:
                     previous_mode = active_mode
                     active_mode = resolve_active_mode(args.mode, capturer)
                     if active_mode != previous_mode:
+                        print_key_help(active_mode)
                         processor = make_vision_processor(
                             active_mode,
                             nogpu=args.nogpu,
@@ -3567,6 +3697,7 @@ def main() -> int:
                             landscape_regen_delay=args.regen_delay,
                             landscape_regen_time=args.regen_time,
                             landscape_bristle_width=args.bristle_width,
+                            landscape_palette=args.palette,
                             plaid_density=args.density,
                             plaid_gain=args.gain,
                             plaid_rotation=args.rotation,
@@ -3614,6 +3745,9 @@ def main() -> int:
                 print(processor.label)
             elif active_mode == "paisagens" and key in LANDSCAPE_IMAGE_KEYS:
                 processor.switch_landscape(LANDSCAPE_IMAGE_KEYS[key])
+                print(processor.label)
+            elif active_mode == "paisagens" and key == LANDSCAPE_PALETTE_KEY:
+                processor.switch_palette()
                 print(processor.label)
             elif active_mode == "paisagens" and key in LANDSCAPE_BRISTLE_KEYS:
                 processor.adjust_bristles(LANDSCAPE_BRISTLE_KEYS[key])

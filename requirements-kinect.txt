@@ -1,3 +1,5 @@
--r requirements.txt
-cython
+# Binding Python do Kinect v1. Precisa da libfreenect do sistema
+# (sudo apt-get install libfreenect-dev build-essential python3-dev); Cython e
+# NumPy para compilar sao instalados pelo proprio pip. Instale junto com
+# requirements.txt (notebook/desktop) ou requirements-pi.txt (Raspberry Pi).
 freenect
