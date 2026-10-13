@@ -2,3 +2,5 @@ numpy<2
 opencv-python==4.11.0.86
 ultralytics
 openvino
+# Metronomo (--metronome); precisa da PortAudio do sistema: apt-get install libportaudio2
+sounddevice>=0.4

@@ -1,0 +1,8 @@
+# Raspberry Pi (--pi): o modo xadrez so precisa de NumPy e OpenCV (e sounddevice
+# para o metronomo opcional).
+# Ultralytics/PyTorch/OpenVINO (modo conexoes) nao sao necessarios.
+# Para o Kinect, instale tambem requirements-kinect.txt.
+numpy<2
+opencv-python==4.11.0.86
+# Metronomo (--metronome); precisa da PortAudio do sistema: apt-get install libportaudio2
+sounddevice>=0.4
