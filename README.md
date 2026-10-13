@@ -198,6 +198,8 @@ Todos os capturadores entregam `(success, frame_bgr, depth, body_mask)`. Webcam 
 - **Debug & Tracking:** vídeo da fonte com máscara, vetores ou caixa/esqueleto conforme o algoritmo, FPS, latência, modo e fonte ativos.
 - **Projetor Corpo/Frontal:** MOG2/Kinect projetam a máscara vermelha; Optical Flow projeta vetores; Conexões projeta a malha interpessoal sem suavização em fundo preto; Capim, Mato e Xadrez projetam o capim, o mato ou o xadrez (o mato cobre a tela inteira); Paisagens projeta a imagem sendo repintada.
 
+`--fullscreen` abre a janela do projetor em tela cheia, sem bordas nem barra de título, no monitor em que ela estiver; `--no-fullscreen` a mantém como janela comum. Sem o argumento, o padrão é tela cheia apenas no `--pi` (que roda ligado ao projetor) e janela comum no perfil normal, para não cobrir a janela de debug. A janela de debug nunca vai a tela cheia. Mova a janela do projetor para o monitor/projetor desejado antes de alternar — o OpenCV usa o monitor atual da janela.
+
 As janelas Chão/Fundo e Simulação/Consolidada estão temporariamente desativadas; o loop não calcula centroide, ondas nem composição dessas telas.
 
 A latência exibida é medida por `time.perf_counter()` desde o timestamp associado ao frame até o fim do ciclo de exibição/`waitKey`. É uma estimativa de software; não mede exposição do sensor, sincronização real dos projetores ou o tempo até o conteúdo aparecer fisicamente. Os timestamps de Kinect e webcam também não são equivalentes, portanto os resultados entre modos não devem ser comparados como uma medição calibrada.
@@ -305,7 +307,7 @@ Exemplo: `feat(projection): add floor and body composite preview`. Enquanto a ve
 
 ## Limitações conhecidas
 
-- OpenCV pode abrir as duas janelas de projetor em tela cheia no mesmo monitor; a disposição depende do sistema de janelas e ainda não há calibração de projetores.
+- `--fullscreen` só escolhe tela cheia ou janela: o monitor usado é o do sistema de janelas e ainda não há posicionamento automático nem calibração de projetores.
 - A medição por modo depende da câmera, resolução, CPU/GPU e backend de exibição; as metas de latência ainda precisam ser medidas no hardware de apresentação.
 - A combinação de sistema operacional, driver, câmera, resolução e projetor determina a latência real.
 

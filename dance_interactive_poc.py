@@ -3280,6 +3280,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "simplificadas e no maximo 40 pulsos",
     )
     parser.add_argument(
+        "--fullscreen",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="abre a janela do projetor em tela cheia (padrao: so com --pi)",
+    )
+    parser.add_argument(
         "--image",
         default=LANDSCAPE_DEFAULT_IMAGE,
         metavar="ARQUIVO_OU_PASTA",
@@ -3548,7 +3554,13 @@ def main() -> int:
     windows = (projector_window,) if args.pi else ("Debug & Tracking", projector_window)
     for window in windows:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty(projector_window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    # Sem --fullscreen explicito, so o perfil --pi (que roda no projetor) abre em tela cheia.
+    fullscreen = args.pi if args.fullscreen is None else args.fullscreen
+    cv2.setWindowProperty(
+        projector_window,
+        cv2.WND_PROP_FULLSCREEN,
+        cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL,
+    )
     last_status_report = time.perf_counter()
 
     recent_frame_times = deque(maxlen=30)
