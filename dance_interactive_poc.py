@@ -1945,10 +1945,18 @@ class LandscapeCanvas:
     """
 
     def __init__(
-        self, width: int, height: int, image: np.ndarray, anchor: float, index: int = 0
+        self,
+        width: int,
+        height: int,
+        image: np.ndarray,
+        anchor: float,
+        index: int = 0,
+        rng: Optional[np.random.Generator] = None,
     ) -> None:
         self.size = (width, height)
         self.gain = 1.0
+        # Sorteia as cerdas; o do processador, para uma semente fixa valer para tudo.
+        self._rng = rng if rng is not None else np.random.default_rng()
         self.regen_delay = LANDSCAPE_REGEN_DELAY
         self.regen_time = LANDSCAPE_REGEN_TIME
         # Segundos sem movimento por celula do fluxo; criado com o primeiro fluxo.
@@ -1969,7 +1977,7 @@ class LandscapeCanvas:
         """Refaz as cerdas com feixes de bristle_width px; o borrao ja feito fica."""
         width, height = self.size
         self.bristle_width = bristle_width
-        noise = np.random.default_rng().standard_normal((height, width)).astype(np.float32)
+        noise = self._rng.standard_normal((height, width)).astype(np.float32)
         noise = cv2.GaussianBlur(noise, (0, 0), bristle_width / 2.0)
         noise /= max(float(noise.std()), 1e-6)
         self._bristles = np.clip(1.0 + LANDSCAPE_BRISTLE * noise, 0.0, 2.0)
@@ -2677,7 +2685,9 @@ class VisionProcessor:
             index = self.landscape_index
             image = self._landscape_images[index][1]
             self._window_cache.clear()
-            return LandscapeCanvas(width, height, image, self._crop_anchor(image), index)
+            return LandscapeCanvas(
+                width, height, image, self._crop_anchor(image), index, self._rng
+            )
         if self.mode == "mato":
             return MeadowField(width, height, self.meadow_density, self._rng)
         if self.mode == "xadrez":
