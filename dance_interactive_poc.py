@@ -205,6 +205,16 @@ CAIPIRA_VOLUME_FLOOR = 0.02
 CAIPIRA_TRACK_MAX_JUMP = 0.2
 CAIPIRA_TRACK_GRACE = 1.0
 CAIPIRA_PLAYER_COLOR = (0, 255, 255)  # BGR: amarelo
+# Fundo do caipira: a imagem da camera (ou do video) atras do xadrez, com brilho
+# de 0 (preto) a CAIPIRA_CAMERA_MAX, em passos de CAIPIRA_CAMERA_STEP pelas teclas
+# u (escurece) e j (clareia); --camera-brightness da o inicial. Ate 1 o brilho
+# escala a imagem (1 = como chega); acima, uma curva gama 1/brilho a clareia sem
+# estourar os claros (2 = gama 0,5: um cinza de 25% vira 50%). As linhas grossas sao
+# compostas com max: so aparecem onde sao mais claras que a imagem.
+DEFAULT_CAMERA_BRIGHTNESS = 0.0
+CAIPIRA_CAMERA_MAX = 2.0
+CAIPIRA_CAMERA_STEP = 0.1
+CAIPIRA_CAMERA_KEYS = {ord("u"): -CAIPIRA_CAMERA_STEP, ord("j"): CAIPIRA_CAMERA_STEP}
 # Tela da obra (caipira): duas colunas na janela do projetor. A esquerda, um
 # terminal que registra tudo o que o programa faz (SYSTEM_LOG, mais tudo o que ele
 # imprime); a direita, a obra, com as caixas dos corpos no matiz das linhas. A obra
@@ -2840,6 +2850,7 @@ class VisionProcessor:
         people_yolo: bool = False,
         arpeggios: Optional[ViolaArpeggios] = None,
         viola_blend: str = VIOLA_BLENDS[0],
+        camera_brightness: float = DEFAULT_CAMERA_BRIGHTNESS,
     ) -> None:
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Modo 2D desconhecido: {mode}")
@@ -2877,6 +2888,13 @@ class VisionProcessor:
         # Alternada pela tecla g na thread principal; o worker so le o valor. No
         # caipira (a obra) fica sempre ligada.
         self.silhouette = silhouette or mode == "caipira"
+        # Caipira: brilho da imagem da camera atras do xadrez (0 = fundo preto),
+        # ajustado pelas teclas u/j na thread principal.
+        if not 0.0 <= camera_brightness <= CAIPIRA_CAMERA_MAX:
+            raise ValueError(f"camera_brightness deve estar entre 0 e {CAIPIRA_CAMERA_MAX:g}")
+        self.camera_brightness = camera_brightness
+        # Tabela (256) do brilho atual, refeita so quando ele muda.
+        self._camera_lut: tuple[float, Optional[np.ndarray]] = (-1.0, None)
         # Criado na primeira vez que a silhueta precisa do MOG2 (sem Kinect).
         self._silhouette_mog2 = None
         # Pessoas detectadas no caipira; o worker escreve, a thread principal le.
@@ -3181,6 +3199,9 @@ class VisionProcessor:
                 + f" | {self.plaid_layout}"
                 + (" | pulsos das maos" if self._hand_tracker is not None else "")
                 + (
+                    f" | camera {self.camera_brightness:.0%}" if self.mode == "caipira" else ""
+                )
+                + (
                     f" | desordem {self.line_disorder:.0%}"
                     f" | pessoas {self._people_source} {self.people_count}"
                     + (
@@ -3263,6 +3284,21 @@ class VisionProcessor:
         self.landscape_gain = round(
             min(LANDSCAPE_MAX_GAIN, max(0.0, self.landscape_gain + gain_delta)), 6
         )
+
+    def adjust_camera_brightness(self, delta: float) -> None:
+        """Caipira: brilho da camera atras do xadrez, de 0 (preto) a 1."""
+        self.camera_brightness = round(
+            min(CAIPIRA_CAMERA_MAX, max(0.0, self.camera_brightness + delta)), 6
+        )
+
+    def _camera_backdrop(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """Imagem da camera no brilho atual: escalada ate 1, clareada por gama acima."""
+        brightness = self.camera_brightness
+        if self._camera_lut[0] != brightness:
+            levels = np.arange(256, dtype=np.float32) / 255.0
+            levels = min(brightness, 1.0) * levels ** (1.0 / max(brightness, 1.0))
+            self._camera_lut = (brightness, np.clip(levels * 255.0 + 0.5, 0, 255).astype(np.uint8))
+        return cv2.LUT(frame_bgr, self._camera_lut[1])
 
     def toggle_silhouette(self) -> None:
         if self.mode != "caipira":
@@ -5079,6 +5115,9 @@ class VisionProcessor:
         # por cima.
         if self.mode in PLAID_MODES and self.silhouette:
             body = self._silhouette_fill(frame_bgr, body_mask, small)
+            if self.mode == "caipira" and self.camera_brightness > 0.0:
+                # A imagem da camera por baixo; a silhueta fica onde e mais clara.
+                body = cv2.max(self._camera_backdrop(frame_bgr), body)
         else:
             body = np.zeros_like(frame_bgr)
         self._field.draw(body)
@@ -6483,6 +6522,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "xadrez, desligada nos outros modos; no caipira, sempre ligada)",
     )
     parser.add_argument(
+        "--camera-brightness",
+        type=float,
+        default=DEFAULT_CAMERA_BRIGHTNESS,
+        help="caipira: brilho da imagem da camera atras do xadrez, de 0 (fundo preto) "
+        f"a {CAIPIRA_CAMERA_MAX:g}; 1 e a imagem como chega e acima dele ela clareia "
+        "(padrao: %(default)s; teclas u/j, passos de 0.1)",
+    )
+    parser.add_argument(
         "--layout",
         choices=tuple(PLAID_LAYOUTS),
         default=None,
@@ -6638,6 +6685,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         parser.error("--gain deve ser >= 0")
     if not PLAID_SENSITIVITY_RANGE[0] <= args.sensitivity <= PLAID_SENSITIVITY_RANGE[1]:
         parser.error("--sensitivity deve estar entre %g e %g" % PLAID_SENSITIVITY_RANGE)
+    if not 0.0 <= args.camera_brightness <= CAIPIRA_CAMERA_MAX:
+        parser.error(f"--camera-brightness deve estar entre 0 e {CAIPIRA_CAMERA_MAX:g}")
     if args.pulses < 0:
         parser.error("--pulses deve ser >= 0")
     return args
@@ -6683,6 +6732,7 @@ def make_vision_processor(
     people_yolo: bool = False,
     arpeggios: Optional[ViolaArpeggios] = None,
     viola_blend: str = VIOLA_BLENDS[0],
+    camera_brightness: float = DEFAULT_CAMERA_BRIGHTNESS,
 ) -> Optional[VisionProcessor]:
     return (
         None
@@ -6720,6 +6770,7 @@ def make_vision_processor(
             people_yolo=people_yolo,
             arpeggios=arpeggios,
             viola_blend=viola_blend,
+            camera_brightness=camera_brightness,
         )
     )
 
@@ -6731,7 +6782,7 @@ MODE_KEY_HELP = {
     "xadrez": "a/z densidade | s/x ganho | h/n sensibilidade | d/c rotacao | f/v matiz | g silhueta | "
     "l malha mix/regular | b fundo (Kinect)",
     "caipira": "a/z densidade | s/x ganho | d/c rotacao | f/v matiz | "
-    "l malha mix/regular | b fundo (Kinect)",
+    "u/j brilho da camera no fundo | l malha mix/regular | b fundo (Kinect)",
     ROLE_MODE: "e borda poligono/serrilhado/suave",
     JECA_MODE: "i proxima pintura | e borda poligono/serrilhado/suave",
     JECATATU_MODE: "e borda poligono/serrilhado/suave | a/z densidade | s/x ganho | "
@@ -6829,6 +6880,7 @@ def main() -> int:
             people_yolo=not args.pi,
             arpeggios=arpeggios,
             viola_blend=args.blend,
+            camera_brightness=args.camera_brightness,
         )
     except Exception as exc:
         capturer.close()
@@ -7059,6 +7111,7 @@ def main() -> int:
                             people_yolo=not args.pi,
                             arpeggios=arpeggios,
                             viola_blend=args.blend,
+                            camera_brightness=args.camera_brightness,
                         )
                     elif processor is not None:
                         processor.reset()
@@ -7090,6 +7143,9 @@ def main() -> int:
                 elif key == LAYOUT_TOGGLE_KEY:
                     processor.toggle_layout()
                     print(processor.label)
+                elif active_mode == "caipira" and key in CAIPIRA_CAMERA_KEYS:
+                    processor.adjust_camera_brightness(CAIPIRA_CAMERA_KEYS[key])
+                    print(f"Fundo: camera a {processor.camera_brightness:.0%}")
                 elif key == ord("b") and isinstance(capturer, KinectV1Capturer):
                     # A silhueta usa a mascara de profundidade, que melhora com o fundo.
                     calibrate_kinect_background(capturer)
