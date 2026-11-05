@@ -211,6 +211,16 @@ CAIPIRA_PLAYER_COLOR = (0, 255, 255)  # BGR: amarelo
 # escala a imagem (1 = como chega); acima, uma curva gama 1/brilho a clareia sem
 # estourar os claros (2 = gama 0,5: um cinza de 25% vira 50%). As linhas grossas sao
 # compostas com max: so aparecem onde sao mais claras que a imagem.
+# Contorno de cada corpo no caipira: a borda externa de cada regiao da mascara da
+# silhueta com ao menos CAIPIRA_MIN_PERSON_AREA (as CAIPIRA_MAX_PEOPLE maiores),
+# no matiz das linhas, por cima do xadrez. A mascara (em SILHOUETTE_SCALE) e
+# suavizada como a silhueta e cortada em 50%, entao o contorno segue a borda
+# visivel do preenchimento. Espessura em fracao da altura do quadro, sobre um halo
+# CAIPIRA_CONTOUR_GLOW vezes mais largo e mais escuro.
+CAIPIRA_CONTOUR_THICKNESS = 0.004
+CAIPIRA_CONTOUR_GLOW = 3
+# Pontos (impar) da media movel que alisa os degraus da mascara reduzida.
+CAIPIRA_CONTOUR_SMOOTH = 5
 DEFAULT_CAMERA_BRIGHTNESS = 0.0
 CAIPIRA_CAMERA_MAX = 2.0
 CAIPIRA_CAMERA_STEP = 0.1
@@ -5214,6 +5224,45 @@ class VisionProcessor:
         )
         return cv2.resize(colored, (width, height), interpolation=cv2.INTER_LINEAR)
 
+    def _draw_body_contours(self, image: np.ndarray, small: np.ndarray) -> None:
+        """Caipira: contorno de cada corpo da mascara da silhueta, no matiz das linhas."""
+        soft = cv2.GaussianBlur(small, (SILHOUETTE_BLUR, SILHOUETTE_BLUR), 0)
+        _, mask = cv2.threshold(soft, 127, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        min_area = CAIPIRA_MIN_PERSON_AREA * mask.shape[0] * mask.shape[1]
+        bodies = sorted(
+            (contour for contour in contours if cv2.contourArea(contour) >= min_area),
+            key=cv2.contourArea,
+            reverse=True,
+        )[:CAIPIRA_MAX_PEOPLE]
+        if not bodies:
+            return
+        # A mascara e reduzida: os pontos seguem os degraus dos pixels. Uma media movel
+        # circular ao longo de cada contorno tira os degraus; depois, o centro de cada
+        # ponto no quadro cheio, com 4 bits de subpixel.
+        shift = 4
+        scale = (1 << shift) / SILHOUETTE_SCALE
+        half = CAIPIRA_CONTOUR_SMOOTH // 2
+        outlines = []
+        for contour in bodies:
+            points = contour[:, 0].astype(np.float32)
+            if len(points) > CAIPIRA_CONTOUR_SMOOTH:
+                ring = np.concatenate((points[-half:], points, points[:half]))
+                summed = np.cumsum(np.vstack((np.zeros((1, 2), np.float32), ring)), axis=0)
+                points = (
+                    summed[CAIPIRA_CONTOUR_SMOOTH:] - summed[:-CAIPIRA_CONTOUR_SMOOTH]
+                ) / CAIPIRA_CONTOUR_SMOOTH
+            outlines.append(np.rint((points + 0.5) * scale).astype(np.int32).reshape(-1, 1, 2))
+        thickness = max(2, round(CAIPIRA_CONTOUR_THICKNESS * image.shape[0]))
+        cv2.polylines(
+            image, outlines, True, hue_bgr(self.live_hue, OBRA_DIM_SV),
+            thickness * CAIPIRA_CONTOUR_GLOW, cv2.LINE_AA, shift,
+        )
+        cv2.polylines(
+            image, outlines, True, hue_bgr(self.live_hue, OBRA_BRIGHT_SV),
+            thickness, cv2.LINE_AA, shift,
+        )
+
     def _landscape_window(self, width: int, height: int) -> np.ndarray:
         """Pintura vista pela silhueta: a proxima da lista, sem borrao.
 
@@ -5337,6 +5386,8 @@ class VisionProcessor:
         else:
             body = np.zeros_like(frame_bgr)
         self._field.draw(body)
+        if self.mode == "caipira":
+            self._draw_body_contours(body, small)
         if self.mode == "paisagens" and self.silhouette:
             self._silhouette_window(body, frame_bgr, body_mask)
         if self.mode == "paisagens" and self.landscape_palette != "original":
