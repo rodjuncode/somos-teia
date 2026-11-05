@@ -14,15 +14,19 @@ Metronomo 4/4 opcional em todos os modos (--metronome, --bpm): t liga/desliga,
 - diminui e = (ou +) aumenta o andamento. Requer libportaudio2 e sounddevice.
 Fonte: --source kinect|webcam|arquivo.mp4; pressione m para alternar as fontes configuradas.
 Use --fallback-video para reserva quando Kinect e webcam falharem.
-Algoritmo: --mode kinect|mog2|optical_flow|conexoes|capim|mato|xadrez. Fontes 2D usam MOG2 por padrao.
+Algoritmo: --mode kinect|mog2|optical_flow|conexoes|capim|mato|paisagens|xadrez|caipira|viola|
+roda-de-viola|jeca|
+jecatatu.
+Sem --mode, o modo e caipira em todas as fontes.
 Faixa inicial: --min-depth/--max-depth (mm). Atalhos Kinect: a/z diminuem/aumentam
 Min Depth; s/x diminuem/aumentam Max Depth, em passos de 100 mm. Pressione b
 com a sala vazia para capturar o fundo e recortar apenas o que se move a frente.
 O modo Kinect usa profundidade em milimetros (DEPTH_MM).
-Atalhos do modo xadrez: a/z diminuem/aumentam a densidade, s/x o ganho, d/c a
+Atalhos dos modos xadrez e caipira: a/z diminuem/aumentam a densidade, s/x o ganho, d/c a
 rotacao do padrao, f/v giram o matiz no disco de cores (anti-horario/horario) e g
 liga/desliga a silhueta dos corpos na cor base (com Kinect, b calibra o fundo);
-l alterna a malha entre regular e mix (malhas em alturas diferentes).
+l alterna a malha entre regular e mix (malhas em alturas diferentes). No caipira,
+i passa a proxima pintura de fundo.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ import colorsys
 import functools
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -134,6 +139,282 @@ GRASS_COLORS = (
     (50, 150, 110),
 )
 # Modo xadrez: padrao Madras de faixas coloridas que se cruzam em xadrez irregular.
+# O modo caipira comeca como uma copia do xadrez: mesmo codigo, teclas e opcoes.
+PLAID_MODES = ("xadrez", "caipira")
+# Modo usado quando --mode nao e informado, em qualquer fonte e no --pi.
+DEFAULT_MODE = "caipira"
+# Sem --hue/--rotation, o caipira parte de laranja e do padrao girado a 45 graus.
+CAIPIRA_HUE = 30.0
+CAIPIRA_ROTATION = 45.0
+# Pessoas na cena, no caipira: regioes separadas da mascara da silhueta (profundidade
+# no Kinect, MOG2 nas outras fontes) com area minima, contadas ate o limite. A
+# mediana dos ultimos quadros evita que a contagem pisque.
+CAIPIRA_MAX_PEOPLE = 5
+CAIPIRA_MIN_PERSON_AREA = 0.01  # fracao da area do quadro
+CAIPIRA_PEOPLE_WINDOW = 9  # quadros
+# Fora do --pi o caipira tambem conta pelo YOLO (cada pessoa detectada), para
+# comparar com a mascara; as caixas de cada metodo aparecem na janela de debug.
+CAIPIRA_MASK_COLOR = (255, 255, 0)  # BGR: ciano
+CAIPIRA_YOLO_COLOR = (255, 0, 255)  # BGR: magenta
+# Pulsos do caipira guiados pela desordem das linhas: o deslocamento medio dos
+# nos em relacao ao repouso, dividido por CAIPIRA_DISORDER_FULL_PX (0 = malha em
+# repouso, 1 = desordem plena). A taxa de nascimento e proporcional a desordem
+# (--pulses vezes CAIPIRA_PULSE_RATE_GAIN na desordem plena; malha parada, sem
+# pulsos novos) e a velocidade vai de CAIPIRA_PULSE_SPEED[0] a [1] vezes a
+# sorteada, valendo tambem para os pulsos que ja estao na linha.
+# Calibrado com a figura sintetica do pi_benchmark.py em 640x480: uma andando
+# desloca os nos ~10-14 px em media (desordem ~40%), tres ~25 px (~85%).
+CAIPIRA_DISORDER_FULL_PX = 30.0
+CAIPIRA_PULSE_RATE_GAIN = 3.0
+CAIPIRA_PULSE_SPEED = (0.25, 3.0)
+# Toada do caipira (--viola): cada pessoa detectada (ate 5) recebe um canal sorteado
+# entre os livres; quem some libera o canal. Pessoas pelo YOLO quando carregado,
+# senao pela mascara da silhueta.
+# Sons: em CAIPIRA_CHANNEL_DIR, como os arpejos (VIOLA_ARPEGGIO_DIR): cada arquivo
+# cujo nome contem "canal1" a "canal5". Todos tocam em loop desde a partida,
+# sincronizados, mudos ate alguem excitar o canal; por isso precisam ter o mesmo
+# andamento e duracao.
+CAIPIRA_CHANNEL_DIR = os.path.join(SCRIPT_DIR, "sons", "toada-caipira")
+VIOLA_EXTENSIONS = (".mp3", ".wav", ".flac")
+VIOLA_SAMPLE_RATE = 44100
+# Latencia de saida em segundos: menor responde mais rapido ao gesto, mas o
+# callback em Python pode falhar (estalos) com as threads de video ocupadas.
+VIOLA_LATENCY = 0.05
+# Excitacao das cordas por uma pessoa: deslocamento medio ao repouso, em px, dos nos
+# do xadrez dentro da sua caixa, dividido por CAIPIRA_EXCITE_FULL_PX (0 a 1). So
+# conta como interacao a partir de CAIPIRA_EXCITE_MIN: estar parada nao muda nada.
+# Volume do canal (0 a 1): com interacao, sobe CAIPIRA_VOLUME_RISE por segundo na
+# excitacao plena (proporcional a ela), ate 1. Sem interacao por mais de
+# CAIPIRA_VOLUME_HOLD s, decai exponencialmente, perdendo metade a cada
+# CAIPIRA_VOLUME_HALF_LIFE s: rapido quando alto, devagar perto do silencio (um
+# fade linear em dB); abaixo de CAIPIRA_VOLUME_FLOOR, silencia. O canal livre
+# continua decaindo do mesmo jeito, e quem o pega comeca do volume em que ele esta.
+CAIPIRA_EXCITE_FULL_PX = 20.0
+CAIPIRA_EXCITE_MIN = 0.15
+CAIPIRA_VOLUME_RISE = 0.25
+CAIPIRA_VOLUME_HOLD = 0.5
+CAIPIRA_VOLUME_HALF_LIFE = 2.0
+CAIPIRA_VOLUME_FLOOR = 0.02
+# Rastreio: cada caixa continua a pessoa do quadro anterior com o centro mais
+# proximo, ate CAIPIRA_TRACK_MAX_JUMP da diagonal do quadro; quem some por mais de
+# CAIPIRA_TRACK_GRACE s libera o canal para a proxima pessoa.
+CAIPIRA_TRACK_MAX_JUMP = 0.2
+CAIPIRA_TRACK_GRACE = 1.0
+CAIPIRA_PLAYER_COLOR = (0, 255, 255)  # BGR: amarelo
+# Fundo do caipira: uma das pinturas de --image (padrao: a pasta paisagens/),
+# sorteada na partida e ajustada ao quadro como no modo paisagens, escurecida
+# para CAIPIRA_BACKGROUND_BRIGHTNESS: as linhas grossas sao compostas com max e
+# so aparecem onde sao mais claras que o fundo. A tecla i passa a proxima.
+CAIPIRA_BACKGROUND_BRIGHTNESS = 0.5
+CAIPIRA_IMAGE_KEY = ord("i")
+# Modo viola: pinturas de --image em sequencia embaralhada, cada uma por
+# VIOLA_SLIDE_SECONDS, passando a seguinte num fade de VIOLA_FADE_SECONDS (tecla i
+# adianta). Cada pessoa detectada (ate 5; YOLO quando carregado, senao a mascara)
+# liga um canal de arpejo, o menor livre; o movimento dela aumenta o volume.
+# Arpejos: em VIOLA_ARPEGGIO_DIR, cada arquivo cujo nome contem "canal1" a
+# "canal5" (mp3, wav ou flac). Todos tocam em loop desde a partida, sincronizados
+# por um relogio unico, mudos ate alguem ligar o canal; por isso precisam ter o
+# mesmo tom, andamento e duracao. MP3 tem silencio extra no inicio e no fim: com o
+# cabecalho LAME/Info (Audacity e ffmpeg o gravam) ele e cortado exatamente; sem
+# ele, prefira WAV ou FLAC, ou o loop solua.
+VIOLA_ARPEGGIO_DIR = os.path.join(SCRIPT_DIR, "sons", "viola-arpejos")
+VIOLA_CHANNELS = 5
+VIOLA_SLIDE_SECONDS = 10.0
+VIOLA_FADE_SECONDS = 2.0
+# Pico de cada canal; a soma passa por um tanh, que so comprime quando varios
+# canais altos coincidem.
+VIOLA_CHANNEL_PEAK = 0.7
+# Volume do canal: VIOLA_CHANNEL_VOLUME[0] com a pessoa parada, [1] com movimento
+# de VIOLA_FULL_MOTION px por quadro ou mais (o mesmo movimento da viola do
+# caipira), suavizado por VIOLA_MOTION_SMOOTHING a cada quadro.
+VIOLA_CHANNEL_VOLUME = (0.25, 1.0)
+VIOLA_FULL_MOTION = 4.0
+VIOLA_MOTION_SMOOTHING = 0.15
+# Mescla do xadrez com as pinturas no modo viola (--blend; tecla e alterna), com a
+# mesma fisica de linhas do caipira (laranja, 45 graus, pulsos pela desordem):
+# - "tecido": a pintura e deformada junto com as linhas, como um tecido cortado
+#   por elas. O deslocamento dos nos vira um campo em grade de VIOLA_WARP_CELL px,
+#   espalhado por um blur de VIOLA_WARP_SIGMA celulas (convolucao normalizada:
+#   areas entre linhas seguem as linhas vizinhas), ampliado e aplicado com um so
+#   cv2.remap. Com a malha em repouso o remap e pulado. A pintura fica com
+#   VIOLA_TEXTILE_BRIGHTNESS para as linhas grossas (compostas com max) aparecerem.
+# - "janela": a pintura so aparece pelas linhas, sobre ela mesma escurecida para
+#   VIOLA_WINDOW_BACKGROUND.
+# - "quadros": como o tecido, mas cada quadrado do xadrez segue a deformacao com
+#   o seu proprio atraso (taxa sorteada em VIOLA_MOSAIC_LAG por quadro, de quase
+#   imediato a ~1 s) e, na troca de pintura, passa a seguinte no seu momento
+#   (atraso sorteado ate VIOLA_MOSAIC_STAGGER do fade), como um mosaico.
+# - "cores": as linhas tem as cores da pintura, levadas ao brilho maximo
+#   (VIOLA_VIVID_MIX) e mais saturadas (VIOLA_VIVID_SATURATION), sobre a pintura a
+#   VIOLA_COLOR_BACKGROUND; a versao viva e calculada uma vez por pintura.
+# A proxima pintura (e a versao viva, nas cores) e preparada numa thread enquanto
+# a atual esta na tela, para a troca nao travar um quadro.
+# - "recorte": as linhas sao uma mascara sobre a pintura, e dentro dela a pintura
+#   se desloca com as linhas. Parada, a malha nao mostra nada (o recorte coincide
+#   com o fundo); com movimento, as tiras deslocadas evidenciam os recortes. Sem
+#   movimento so a pintura e copiada; a mascara e desenhada em 1 canal, sem cor,
+#   pulsos nem anti-aliasing.
+# - "nenhuma": so as pinturas, sem calcular o xadrez.
+VIOLA_BLENDS = ("tecido", "quadros", "cores", "janela", "recorte", "nenhuma")
+VIOLA_BLEND_KEY = ord("e")
+VIOLA_WARP_CELL = 16
+VIOLA_WARP_SIGMA = 2.5
+VIOLA_TEXTILE_BRIGHTNESS = 0.75
+VIOLA_WINDOW_BACKGROUND = 0.2
+VIOLA_MOSAIC_LAG = (0.03, 0.6)
+VIOLA_MOSAIC_STAGGER = 0.6
+VIOLA_VIVID_MIX = 0.6
+VIOLA_VIVID_SATURATION = 1.8
+VIOLA_COLOR_BACKGROUND = 0.06
+VIOLA_COLOR_LIGHT_GAIN = 1.6
+# Modo roda-de-viola: cada pessoa (ate 5) vira uma silhueta recortada numa paisagem
+# propria, sorteada entre as livres e fixa enquanto ela estiver em cena, sobre
+# fundo branco; os arpejos tocam como no modo viola. As silhuetas vem de um modelo
+# de segmentacao por instancia (YOLO11n-seg: uma mascara por pessoa, mesmo
+# encostadas), em ROLE_SEG_IMGSZ px. Cada mascara e suavizada no tempo
+# (ROLE_MASK_SMOOTHING por quadro; 1 = sem suavizacao) e composta em ROLE_ALPHA_SCALE
+# da resolucao, so dentro da caixa da pessoa. Borda (ROLE_EDGE_STYLES, tecla e):
+# - "poligono": o contorno externo e simplificado (cv2.approxPolyDP) em poucos lados
+#   retos e preenchido; ROLE_POLYGON_EPSILON (fracao da altura do quadro) e o
+#   desvio maximo da forma: maior = menos lados, mais rustico. Pedacos menores que
+#   ROLE_POLYGON_MIN_AREA da area sao descartados; buracos (entre braco e corpo)
+#   sao preenchidos.
+# - "serrilhado": dentro/fora (limiar 0,5) ampliado sem interpolacao, com os
+#   degraus da mascara do modelo (~4 px em 720p).
+# - "suave": borda desfocada (ROLE_EDGE_SIGMA px) misturada ao branco.
+YOLO_SEG_MODEL = os.path.join(SCRIPT_DIR, "yolo11n-seg.pt")
+ROLE_MODE = "roda-de-viola"
+ROLE_SEG_IMGSZ = 320
+ROLE_SEG_CONFIDENCE = 0.35
+ROLE_ALPHA_SCALE = 0.5
+ROLE_MASK_SMOOTHING = 0.6
+ROLE_EDGE_STYLES = ("poligono", "serrilhado", "suave")
+ROLE_EDGE_KEY = ord("e")
+ROLE_EDGE_SIGMA = 2.0
+ROLE_POLYGON_EPSILON = 0.02
+ROLE_POLYGON_MIN_AREA = 0.002
+# Estabilidade do poligono: as facetas atuais ficam (so deslocadas com o corpo)
+# enquanto a sobreposicao (IoU) com a forma nova for de ROLE_POLYGON_HOLD_IOU ou mais;
+# abaixo disso, a pose mudou e o poligono e refeito. A posicao segue o centro da
+# mascara com zona morta de ROLE_POLYGON_DEADBAND px da mascara pequena (~3 px em
+# 720p): o ruido nao a move, e acima disso ela acompanha o corpo continuamente.
+ROLE_POLYGON_HOLD_IOU = 0.92
+ROLE_POLYGON_DEADBAND = 1.5
+# Cordas da roda: cada pessoa em cena e ligada a cada uma das outras por
+# ROLE_STRING_COUNT cordas, como as 10 da viola. As pontas de cada corda sao
+# sorteadas dentro de cada silhueta (cabeca, tronco, pernas...), uma vez por par de
+# pessoas, e guardadas relativas a caixa de cada uma: acompanham o corpo sem tremer.
+# Com 5 pessoas sao 10 ligacoes, 100 cordas. As cordas sao fios de 1 px desenhados
+# como tinta semitransparente (ROLE_STRING_OPACITY), que escurece o que esta por
+# baixo, para parecerem mais finas que 1 px; a composicao e feita so na regiao das
+# cordas. Elas vibram de leve em onda estacionaria (metade delas no modo
+# fundamental, metade uma oitava acima, com dois ventres, como os pares oitavados
+# do cebolao), cada uma com fase propria. Quanto mais perto os corpos, maior a
+# vibracao: a amplitude vai de ROLE_STRING_IDLE (a ROLE_STRING_FAR da diagonal ou
+# mais) ao maximo, ROLE_STRING_AMPLITUDE da altura do quadro (a ROLE_STRING_NEAR ou
+# menos); e, como numa corda mais curta, a frequencia sobe de ROLE_STRING_HZ[0] a
+# [1]. Quem nao e visto ha mais de ROLE_STRING_HOLD s perde as cordas.
+ROLE_STRING_COUNT = 10
+ROLE_STRING_NEAR = 0.15
+ROLE_STRING_FAR = 0.7
+ROLE_STRING_AMPLITUDE = 0.012
+ROLE_STRING_IDLE = 0.05
+ROLE_STRING_HZ = (3.0, 9.0)
+ROLE_STRING_SAMPLES = 48
+ROLE_STRING_HOLD = 0.2
+ROLE_STRING_OPACITY = 0.45
+# Modo jeca: as pinturas de --image em sequencia ao fundo (como no modo viola) e,
+# por cima, as silhuetas das pessoas (as do roda-de-viola, ate 5) recortadas num
+# xadrez proprio de cada uma, com os vaos transparentes: so as faixas sao
+# desenhadas e a pintura aparece entre elas. Cada xadrez tem uma paleta de
+# JECA_PLAID_COLORS cores (2 a 6) em torno de um matiz por pessoa (JECA_PLAID_HUES,
+# pela ordem de chegada): analogas, a complementar e acentos, com luminosidades
+# diferentes, em rodizio pelas faixas. O sett e de linhas delicadas (fios de 1 a
+# 3 px em 720p, a maioria em grupos de 2 a 4 fios de 1 px), igual nas duas
+# direcoes; onde as linhas se cruzam, as cores se misturam. Cada xadrez tem uma
+# rotacao sorteada (0 a 180 graus) e fixa. O tecido (periodo de JECA_PLAID_PERIOD
+# da altura do quadro) e desenhado uma vez por pessoa e acompanha o corpo como
+# uma roupa, com zona morta de JECA_PLAID_DEADBAND px.
+JECA_MODE = "jeca"
+JECA_PLAID_HUES = (30.0, 200.0, 330.0, 110.0, 265.0)
+JECA_PLAID_PERIOD = 0.22
+JECA_PLAID_DEADBAND = 3.0
+JECA_PLAID_COLORS = (2, 6)
+# Modo jecatatu: sobre fundo preto (JECATATU_BACKGROUND), as silhuetas do
+# roda-de-viola (poligonais e estabilizadas, ate 5), cada uma recortada numa
+# paisagem propria e fixa; por cima de todas, o xadrez do caipira (laranja, 90
+# graus, layout regular), sem pulsos de luz. O xadrez reage aos pontos de
+# contato de cada pessoa: cabeca, maos e pes, do YOLO de pose. Cada ponto empurra
+# as linhas com a sua velocidade, num raio de JECATATU_PUSH_RADIUS da altura do
+# quadro, mas so gestos bruscos: abaixo de JECATATU_PUSH_MIN px/quadro (em 720p) o
+# ponto nao mexe nas linhas. Um gesto mais brusco ainda (JECATATU_CONTACT_SPEED
+# px/quadro ou mais) e um contato: a silhueta da pessoa brilha, um halo que sai do
+# contorno (a mascara desfocada em JECATATU_GLOW_RADIUS da altura do quadro, somada por
+# cima de tudo num tom claro do matiz do xadrez; dentro do corpo so
+# JECATATU_GLOW_INSIDE dele), e o brilho decai com constante de JECATATU_GLOW_SECONDS s; um
+# novo contato o reacende. O ponto rearma abaixo de JECATATU_CONTACT_RELEASE e espera
+# JECATATU_CONTACT_COOLDOWN s entre contatos.
+# Som: cada pessoa em cena mantem tocando o seu canal de arpejo (os do modo viola,
+# canal1 a canal5, pela ordem de chegada), em loop e volume constante
+# (JECATATU_ARPEGGIO_VOLUME), cada um no seu proprio tempo: um deslocamento sorteado
+# no loop, entao pessoas separadas nao casam no compasso. Silhuetas fundidas passam a
+# compartilhar o tempo da primeira pessoa do grupo (menor canal) e ficam sincronizadas;
+# ao se separar, cada uma volta ao seu. A troca de tempo nao e um salto: o canal faz
+# um crossfade de VIOLA_SYNC_FADE s entre a posicao atual e a nova, sem mudar a altura.
+JECATATU_MODE = "jecatatu"
+JECATATU_BACKGROUND = (0, 0, 0)
+JECATATU_ARPEGGIO_VOLUME = 0.8
+# Angulo inicial do xadrez no jecatatu (sem --rotation; teclas d/c giram).
+JECATATU_ROTATION = 90.0
+JECATATU_PUSH_RADIUS = 0.06
+JECATATU_PUSH_MIN = 15.0
+JECATATU_PUSH_GAIN = 1.0
+JECATATU_CONTACT_SPEED = 24.0
+JECATATU_CONTACT_RELEASE = 10.0
+JECATATU_CONTACT_COOLDOWN = 0.35
+JECATATU_GLOW_SECONDS = 0.35
+JECATATU_GLOW_RADIUS = 0.045
+JECATATU_GLOW_GAIN = 1.6
+# Fracao do brilho dentro da silhueta (o resto e o halo em volta).
+JECATATU_GLOW_INSIDE = 0.25
+# Mistura do matiz do xadrez com branco na cor do brilho (1 = branco).
+JECATATU_GLOW_WHITE = 0.55
+# Resolucao do calculo do brilho, em relacao a mascara de meia resolucao.
+JECATATU_GLOW_SCALE = 0.25
+JECATATU_CONTACT_JUMP = 0.12
+# Velocidade de cada ponto: mediana dos ultimos JECATATU_VELOCITY_FRAMES passos (um
+# salto de um quadro so do modelo de pose e descartado).
+JECATATU_VELOCITY_FRAMES = 5
+# Confianca media minima de uma pose (abaixo: fantasma do fundo, descartada).
+JECATATU_POSE_CONFIDENCE = 0.45
+# Silhuetas proximas se fundem: quando a distancia entre as mascaras de duas pessoas
+# cai a JECATATU_MERGE_DISTANCE da altura do quadro ou menos, elas viram um poligono so
+# (as mascaras unidas e fechadas, com uma ponte sobre o vao), preenchido por outra
+# paisagem, diferente das delas; tres ou mais proximas em cadeia formam um grupo so.
+# Para separar, a
+# distancia precisa passar de JECATATU_SPLIT_DISTANCE (a folga evita que a forma pisque
+# no limite). A paisagem do grupo e fixa enquanto ele durar; ao se separarem, cada uma
+# volta a sua.
+JECATATU_MERGE_DISTANCE = 0.04
+JECATATU_SPLIT_DISTANCE = 0.07
+# Pontos COCO: cabeca = media de nariz, olhos e orelhas; maos = pulsos; pes = tornozelos.
+JECATATU_KEYPOINTS = (
+    ("cabeca", (0, 1, 2, 3, 4)),
+    ("mao", (9,)),
+    ("mao", (10,)),
+    ("pe", (15,)),
+    ("pe", (16,)),
+)
+JECATATU_PART_COLORS = {"cabeca": (0, 255, 255), "mao": (255, 0, 255), "pe": (0, 255, 0)}
+# Rampas de volume no audio, em unidades de volume por segundo: entra em ~0,3 s e
+# sai em ~1,5 s, sem estalos.
+VIOLA_VOLUME_RISE = 1.0 / 0.3
+VIOLA_VOLUME_FALL = 1.0 / 1.5
+# Troca de tempo de um canal (jecatatu): crossfade, em segundos, entre a posicao atual
+# no loop e a nova.
+VIOLA_SYNC_FADE = 2.0
+# Atraso de decodificacao do MP3 (minimp3), somado ao do codificador no corte.
+MP3_DECODER_DELAY = 529
 # Comprimentos em fracao da altura do quadro, divididos por --density.
 DEFAULT_PLAID_DENSITY = 1.0
 DEFAULT_PLAID_GAIN = 1.0
@@ -257,7 +538,7 @@ class PlaidRender:
 # metade das amostras (as linhas so curvam onde o fluxo as empurra), menos pulsos
 # simultaneos e sem quadro de debug.
 # Modos aceitos pelo --pi; o primeiro e o padrao.
-PI_MODES = ("xadrez", "paisagens")
+PI_MODES = ("caipira", "xadrez", "paisagens")
 # Intervalo, em segundos, entre os relatorios de FPS no terminal com --pi.
 PI_STATUS_INTERVAL = 5.0
 PI_PLAID_RENDER = PlaidRender(
@@ -1172,6 +1453,12 @@ class ElasticLines:
             out=displacement,
         )
 
+    def displacement_total(self) -> tuple[float, int]:
+        """Soma do deslocamento dos nos internos ao repouso (px) e quantos sao."""
+        inner = self._displacement[:, 1:-1]
+        total = float(np.hypot(inner[..., 0], inner[..., 1]).sum())
+        return total, inner.shape[0] * inner.shape[1]
+
     def curves(self) -> np.ndarray:
         """Pontos (linhas, amostras, 2) das curvas, em float32."""
         nodes = self._rest + self._displacement
@@ -1211,6 +1498,8 @@ class NeonPulses:
         render: PlaidRender = PlaidRender(),
     ) -> None:
         self.rate = rate
+        # Multiplica a velocidade de todos os pulsos (o caipira a liga a desordem).
+        self.speed_scale = 1.0
         self._rng = rng
         self._render = render
         self._line_counts = np.asarray(line_counts, dtype=np.intp)
@@ -1257,7 +1546,7 @@ class NeonPulses:
 
     def advance(self, dt: float) -> None:
         """Move os pulsos dt segundos, descarta os que sairam e sorteia novos."""
-        self._position += self._speed * dt
+        self._position += self._speed * (self.speed_scale * dt)
         alive = self._position - self._tail < self._sample_counts[self._family] - 1
         for name in ("_family", "_line", "_position", "_speed", "_tail", "_reverse"):
             setattr(self, name, getattr(self, name)[alive])
@@ -1426,6 +1715,10 @@ class PlaidField:
         for family in self._families:
             family.update(flow, scale, threshold, gain)
 
+    def displacement_total(self) -> tuple[float, int]:
+        totals = [family.displacement_total() for family in self._families]
+        return sum(total for total, _ in totals), sum(count for _, count in totals)
+
     def line_batches(self, hue: float) -> tuple[list, list]:
         """Curvas em float de cada familia e lotes (espessura, cor, polilinhas)."""
         palette = [
@@ -1469,6 +1762,9 @@ class PlaidStack:
         # Ganho e matiz valem no proximo frame, sem recriar as malhas.
         self.gain = 1.0
         self.hue = 0.0
+        # Caipira: taxa e velocidade dos pulsos seguem a desordem (0 a 1).
+        self.disorder_pulses = False
+        self.disorder = 0.0
         self._layers = []
         for pattern_index, (density_factor, brightness, push, thickness_delta) in PLAID_LAYOUTS[layout]:
             sett, phases, angle_offset = patterns[pattern_index]
@@ -1488,8 +1784,11 @@ class PlaidStack:
             self._layers.append((field, push))
         # --pulses e o total: cada camada recebe a parte proporcional as suas linhas.
         total = len(self)
-        for field, _ in self._layers:
-            field.pulses.rate = pulse_rate * len(field) / total if total else 0.0
+        self._pulse_shares = [
+            pulse_rate * len(field) / total if total else 0.0 for field, _ in self._layers
+        ]
+        for (field, _), share in zip(self._layers, self._pulse_shares):
+            field.pulses.rate = share
         self._scratch = np.zeros((height, width, 3), dtype=np.uint8)
 
     def __len__(self) -> int:
@@ -1498,6 +1797,19 @@ class PlaidStack:
     @property
     def pulse_count(self) -> int:
         return sum(len(field.pulses) for field, _ in self._layers)
+
+    def node_motion(self) -> tuple[np.ndarray, np.ndarray]:
+        """Posicao atual e deslocamento de todos os nos, (nos, 2) cada."""
+        positions, moves = [], []
+        for field, _ in self._layers:
+            for family in field._families:
+                if len(family):
+                    moves.append(family._displacement.reshape(-1, 2))
+                    positions.append(family._rest.reshape(-1, 2) + moves[-1])
+        if not moves:
+            empty = np.empty((0, 2), dtype=np.float32)
+            return empty, empty
+        return np.concatenate(positions), np.concatenate(moves)
 
     def reset(self) -> None:
         for field, _ in self._layers:
@@ -1510,8 +1822,29 @@ class PlaidStack:
             field.update(flow, scale, threshold, self.gain * push)
 
     def advance(self, dt: float) -> None:
+        if self.disorder_pulses:
+            self._drive_pulses()
         for field, _ in self._layers:
             field.pulses.advance(dt)
+
+    def _drive_pulses(self) -> None:
+        """Taxa e velocidade dos pulsos proporcionais a desordem das linhas."""
+        totals = [field.displacement_total() for field, _ in self._layers]
+        count = sum(nodes for _, nodes in totals)
+        mean = sum(total for total, _ in totals) / count if count else 0.0
+        self.disorder = min(1.0, mean / CAIPIRA_DISORDER_FULL_PX)
+        slow, fast = CAIPIRA_PULSE_SPEED
+        for (field, _), share in zip(self._layers, self._pulse_shares):
+            field.pulses.rate = share * CAIPIRA_PULSE_RATE_GAIN * self.disorder
+            field.pulses.speed_scale = slow + (fast - slow) * self.disorder
+
+    def draw_mask(self, mask: np.ndarray) -> None:
+        """Linhas em 255 numa mascara de um canal: sem cor, pulsos nem anti-aliasing,
+        bem mais barato que draw()."""
+        for field, _ in self._layers:
+            _, batches = field.line_batches(self.hue)
+            for thickness, _, lines in batches:
+                cv2.polylines(mask, lines, False, 255, thickness, cv2.LINE_8)
 
     def draw(self, image: np.ndarray) -> None:
         drawn = [field.line_batches(self.hue) for field, _ in self._layers]
@@ -1929,6 +2262,179 @@ class GrassField:
                 )
 
 
+def make_jeca_plaid(
+    rng: np.random.Generator, hue: float, height: int
+) -> tuple[int, list[tuple[int, int, int]], np.ndarray]:
+    """Sett do xadrez do modo jeca: (periodo em px, faixas (inicio, largura, cor), paleta BGR).
+
+    Paleta de JECA_PLAID_COLORS cores em torno do matiz dado; linhas delicadas (fios
+    soltos e grupos de fios de 1 px) separadas por vaos transparentes, com as cores
+    em rodizio para todas aparecerem.
+    """
+    period = max(24, round(JECA_PLAID_PERIOD * height))
+    unit = height / 720.0
+    count = int(rng.integers(JECA_PLAID_COLORS[0], JECA_PLAID_COLORS[1] + 1))
+    # Matiz da pessoa, analogas, a complementar e acentos, em luminosidades variadas.
+    offsets = (0.0, 30.0, -30.0, 180.0, 65.0, -115.0)[:count]
+    palette = []
+    for offset in offsets:
+        red, green, blue = colorsys.hls_to_rgb(
+            ((hue + offset + rng.uniform(-8.0, 8.0)) % 360.0) / 360.0,
+            rng.uniform(0.32, 0.8),
+            rng.uniform(0.55, 0.95),
+        )
+        palette.append((blue * 255.0, green * 255.0, red * 255.0))
+    thin = max(1, round(unit))
+    stripes = []
+    order = list(rng.permutation(count))
+    cursor = 0
+    while cursor < period:
+        # Cores em rodizio embaralhado: todas aparecem no sett.
+        if not order:
+            order = list(rng.permutation(count))
+        color = int(order.pop())
+        if rng.random() < 0.3:
+            widths = [max(1, round(float(rng.choice((2, 3))) * unit))]
+        else:
+            widths = [thin] * int(rng.integers(2, 5))
+        for width in widths:
+            if cursor + width > period:
+                break
+            stripes.append((cursor, width, color))
+            cursor += width + max(1, round(2 * unit))
+        cursor += max(2, round(float(rng.uniform(6.0, 18.0)) * unit))
+    return period, stripes, np.array(palette, dtype=np.float32)
+
+
+def jeca_plaid_lattice(period: int, angle: float) -> tuple[np.ndarray, float]:
+    """Vetor inteiro (a, b) mais proximo de period no angulo dado, e o angulo dele.
+
+    Com um passo de repeticao inteiro, o tecido girado se repete exatamente em
+    pixels inteiros (a, b) e (-b, a), e o recorte nunca salta.
+    """
+    radians = math.radians(angle)
+    lattice = np.rint((period * math.cos(radians), period * math.sin(radians))).astype(int)
+    if not lattice.any():
+        lattice = np.array((period, 0))
+    return lattice, math.degrees(math.atan2(lattice[1], lattice[0]))
+
+
+def render_jeca_plaid(
+    period: int,
+    stripes: list[tuple[int, int, int]],
+    palette: np.ndarray,
+    lattice: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Tecido de width x height com o sett girado ao longo do vetor inteiro lattice:
+    cores BGR e linhas (booleano).
+
+    As linhas sao desenhadas ja inclinadas (cv2.line, LINE_8), e nao giradas depois
+    como imagem: fios de 1 px continuam continuos e nitidos em qualquer angulo. Cada
+    repeticao e o mesmo traco deslocado por um vetor inteiro, entao o tecido se
+    repete exatamente. Nos cruzamentos as duas cores se misturam.
+    """
+    step = float(np.hypot(*lattice))
+    first = lattice.astype(np.float64) / step
+    second = np.array((-first[1], first[0]))
+    # Posicoes do sett proporcionais ao passo real (que difere pouco de period).
+    ratio = step / period
+    center = np.array((width // 2, height // 2), dtype=np.float64)
+    reach = math.hypot(width, height) / 2.0 + step
+    repeats = range(-math.ceil(reach / step) - 1, math.ceil(reach / step) + 1)
+    shift = 4
+    families = []
+    lattices = (lattice, np.array((-lattice[1], lattice[0])))
+    for (across, along), vector in zip(((first, second), (second, first)), lattices):
+        # Indice da cor + 1 de cada pixel (0 = sem linha).
+        layer = np.zeros((height, width), dtype=np.uint8)
+        for repeat in repeats:
+            for start, line_width, color in stripes:
+                # Parte inteira (repeticoes do vetor) separada: tracos identicos.
+                middle = (
+                    center + repeat * vector + across * ((start + line_width / 2.0) * ratio)
+                )
+                ends = [
+                    tuple(int(round(value * (1 << shift))) for value in point)
+                    for point in (middle - along * reach, middle + along * reach)
+                ]
+                cv2.line(layer, ends[0], ends[1], color + 1, line_width, cv2.LINE_8, shift)
+        families.append(layer)
+    # Cor de cada combinacao (linha de uma familia, da outra, das duas) numa tabela:
+    # indice = linha * (cores + 1) + coluna, aplicada com cv2.LUT.
+    count = len(palette) + 1
+    combined = cv2.add(cv2.multiply(families[0], count), families[1])
+    table = np.zeros((256, 3), dtype=np.float32)
+    for row in range(count):
+        for column in range(count):
+            if row and column:
+                color = (palette[row - 1] + palette[column - 1]) / 2.0
+            elif row or column:
+                color = palette[max(row, column) - 1]
+            else:
+                continue
+            table[row * count + column] = color
+    texture = cv2.LUT(cv2.merge((combined, combined, combined)), table.astype(np.uint8)[None])
+    return texture, combined > 0
+
+
+class PersonSegmenter:
+    """Uma mascara por pessoa (YOLO-seg do Ultralytics), na GPU NVIDIA quando ha."""
+
+    def __init__(self, nogpu: bool = False) -> None:
+        try:
+            import torch
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError(
+                f"O modo {ROLE_MODE} requer ultralytics/PyTorch; instale com "
+                "python -m pip install -r requirements.txt"
+            ) from exc
+        if not os.path.isfile(YOLO_SEG_MODEL):
+            print(
+                f"Primeiro uso do modo {ROLE_MODE}: baixando "
+                f"{os.path.basename(YOLO_SEG_MODEL)} (~6 MB) para {SCRIPT_DIR}; precisa de "
+                "internet.",
+                flush=True,
+            )
+        cuda = bool(torch.cuda.is_available()) and not nogpu
+        self._device = 0 if cuda else "cpu"
+        self.label = "YOLO11n-seg / " + ("NVIDIA GPU" if cuda else "CPU")
+        self._model = YOLO(YOLO_SEG_MODEL)
+
+    def people(
+        self, frame_bgr: np.ndarray
+    ) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray]]:
+        """Caixas (x0, y0, x1, y1) no quadro e mascaras (0 ou 1) do quadro inteiro,
+        na escala do modelo, sem as bordas do letterbox."""
+        result = self._model(
+            frame_bgr,
+            imgsz=ROLE_SEG_IMGSZ,
+            classes=[0],
+            conf=ROLE_SEG_CONFIDENCE,
+            max_det=YOLO_MAX_DETECTIONS,
+            device=self._device,
+            verbose=False,
+        )[0]
+        if result.masks is None:
+            return [], []
+        masks = result.masks.data.cpu().numpy().astype(np.float32)
+        height, width = frame_bgr.shape[:2]
+        mask_height, mask_width = masks.shape[1:]
+        ratio = min(mask_height / height, mask_width / width)
+        inner_width, inner_height = round(width * ratio), round(height * ratio)
+        # Mesmo arredondamento do letterbox do Ultralytics.
+        left = round((mask_width - inner_width) / 2 - 0.1)
+        top = round((mask_height - inner_height) / 2 - 0.1)
+        masks = masks[:, top : top + inner_height, left : left + inner_width]
+        boxes = [
+            tuple(int(round(value)) for value in box)
+            for box in result.boxes.xyxy.cpu().numpy().tolist()
+        ]
+        return boxes, list(masks)
+
+
 class VisionProcessor:
     """Runs one selected 2D algorithm on each new BGR frame."""
 
@@ -1940,6 +2446,11 @@ class VisionProcessor:
         "mato": "Mato (Optical Flow)",
         "paisagens": "Paisagens (Optical Flow)",
         "xadrez": "Xadrez Madras (Optical Flow)",
+        "caipira": "Caipira (Optical Flow)",
+        "viola": "Viola (arpejos)",
+        ROLE_MODE: "Roda de viola (silhuetas)",
+        JECA_MODE: "Jeca (silhuetas em xadrez)",
+        JECATATU_MODE: "Jecatatu (silhuetas, xadrez e arpejos)",
     }
     HEAD_NODE = 17
     NODE_GROUPS = (
@@ -1986,12 +2497,15 @@ class VisionProcessor:
         landscape_palette: str = "original",
         plaid_density: float = DEFAULT_PLAID_DENSITY,
         plaid_gain: float = DEFAULT_PLAID_GAIN,
-        plaid_rotation: float = DEFAULT_PLAID_ROTATION,
+        plaid_rotation: Optional[float] = None,
         plaid_hue: Optional[float] = None,
         pulse_rate: float = DEFAULT_PULSE_RATE,
         silhouette: bool = False,
         plaid_layout: str = "mix",
         render: PlaidRender = PlaidRender(),
+        people_yolo: bool = False,
+        arpeggios: Optional[ViolaArpeggios] = None,
+        viola_blend: str = VIOLA_BLENDS[0],
     ) -> None:
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Modo 2D desconhecido: {mode}")
@@ -2022,6 +2536,68 @@ class VisionProcessor:
         self.silhouette = silhouette
         # Criado na primeira vez que a silhueta precisa do MOG2 (sem Kinect).
         self._silhouette_mog2 = None
+        # Pessoas detectadas no caipira; o worker escreve, a thread principal le.
+        # Desordem das linhas do caipira (0 a 1), que guia os pulsos.
+        self.line_disorder = 0.0
+        self.people_count = 0
+        self._people_history: deque[int] = deque(maxlen=CAIPIRA_PEOPLE_WINDOW)
+        # Caixas (x0, y0, x1, y1) do ultimo quadro, para o debug, e origem da
+        # mascara contada: "Kinect" (profundidade) ou "MOG2".
+        self._people_boxes: list[tuple[int, int, int, int]] = []
+        self._people_source = "MOG2"
+        # Contagem pelo YOLO; None quando ele nao esta carregado.
+        self.people_count_yolo: Optional[int] = None
+        self._people_yolo_history: deque[int] = deque(maxlen=CAIPIRA_PEOPLE_WINDOW)
+        self._people_yolo_boxes: list[tuple[int, int, int, int]] = []
+        # Pessoas rastreadas, cada uma com o seu canal (caipira, viola e roda).
+        self._viola_players: list[ViolaPlayer] = []
+        # Canais em loop: a toada no caipira, os arpejos na viola, roda e jecatatu.
+        self.arpeggios = (
+            arpeggios if mode in ("caipira", "viola", ROLE_MODE, JECATATU_MODE) else None
+        )
+        # Caipira: volume (0 a 1) de cada canal e o instante da ultima interacao,
+        # guardados por canal para quem sai deixar o canal decaindo.
+        self._toada_levels: dict[int, float] = {}
+        self._toada_excited: dict[int, float] = {}
+        self._toada_clock: Optional[float] = None
+        # Roda de viola: segmentacao por pessoa e fundo branco guardado.
+        self._segmenter: Optional[PersonSegmenter] = None
+        self._white: Optional[np.ndarray] = None
+        # Jecatatu: pontos de contato do quadro anterior e fundo guardado.
+        self._contacts: list[dict] = []
+        self._black: Optional[np.ndarray] = None
+        self.contact_count = 0
+        # Pares de silhuetas somadas (slots) e a paisagem de cada grupo.
+        self._merged_pairs: set[tuple[int, int]] = set()
+        self._group_paintings: dict[frozenset[int], int] = {}
+        # Forma fundida de cada grupo (mascara e poligono estabilizado).
+        self._group_shapes: dict[frozenset[int], SilhouetteShape] = {}
+        # Pontas das cordas de cada par de pessoas (relativas as caixas), por par.
+        self._string_pairs: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+        # Alternado pela tecla e na thread principal; o worker so le o valor.
+        self.role_edge = ROLE_EDGE_STYLES[0]
+        self.channel_volumes: dict[int, float] = {}
+        self._slide_cache: dict[tuple[int, int, int, bool], np.ndarray] = {}
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._slide_queue: list[int] = []
+        self._slide_start: Optional[float] = None
+        self._slide_skip = False
+        if viola_blend not in VIOLA_BLENDS:
+            raise ValueError(f"Mescla desconhecida: {viola_blend}")
+        # Alternada pela tecla e na thread principal; o worker so le o valor.
+        self.viola_blend = viola_blend
+        # Coordenadas dos centros da grade do tecido, refeitas quando o quadro muda.
+        self._warp_size: Optional[tuple[int, int, int, int]] = None
+        self._warp_grid: Optional[np.ndarray] = None
+        # Quadros: quadrado de cada celula/pixel por malha, atraso de cada quadrado
+        # (taxa por quadro e inicio na troca) e o deslocamento atrasado.
+        self._mosaic_key: Optional[tuple[int, int, int]] = None
+        self._mosaic_maps: tuple[np.ndarray, np.ndarray] = (np.empty(0), np.empty(0))
+        self._mosaic_shift: Optional[np.ndarray] = None
+        mosaic_rng = np.random.default_rng()
+        self._mosaic_rates = mosaic_rng.uniform(*VIOLA_MOSAIC_LAG, 256).astype(np.float32)
+        self._mosaic_offsets = mosaic_rng.uniform(0.0, VIOLA_MOSAIC_STAGGER, 256)
+        self._viola_now = 0.0
         # Quadro de cor solida da silhueta de borda dura, refeito quando cor ou
         # tamanho mudam.
         self._solid: Optional[np.ndarray] = None
@@ -2060,7 +2636,7 @@ class VisionProcessor:
         self.landscape_index = 0
         # Pinturas ja ajustadas ao quadro para a janela da silhueta, por (indice, tamanho).
         self._window_cache: dict[tuple[int, int, int], np.ndarray] = {}
-        if mode == "paisagens":
+        if mode in ("paisagens", "caipira", "viola", ROLE_MODE, JECA_MODE, JECATATU_MODE):
             for path in list_landscape_images(landscape_image):
                 image = cv2.imread(path, cv2.IMREAD_COLOR)
                 if image is None:
@@ -2070,23 +2646,44 @@ class VisionProcessor:
         # Ajustaveis por teclado (adjust_plaid) enquanto o worker processa: o
         # worker so le os valores e recria a malha quando densidade/rotacao mudam.
         self.plaid_density = min(plaid_density, self._max_plaid_density())
-        if mode == "xadrez" and self.plaid_density < plaid_density:
+        if mode in PLAID_MODES and self.plaid_density < plaid_density:
             print(
                 f"Aviso: no layout mix a densidade e limitada a {PLAID_MIX_MAX_DENSITY}; "
                 f"usando {self.plaid_density} em vez de {plaid_density}.",
                 file=sys.stderr,
             )
         self.plaid_gain = plaid_gain
+        if plaid_rotation is None:
+            plaid_rotation = (
+                JECATATU_ROTATION
+                if mode == JECATATU_MODE
+                else CAIPIRA_ROTATION
+                if mode in ("caipira", "viola")
+                else DEFAULT_PLAID_ROTATION
+            )
         self.plaid_rotation = plaid_rotation % 360.0
         self._rng = np.random.default_rng()
-        # Sem --hue, o matiz base e sorteado.
-        self.plaid_hue = (
-            float(self._rng.uniform(0.0, 360.0)) if plaid_hue is None else plaid_hue % 360.0
-        )
+        if mode in ("caipira", "viola", JECA_MODE):
+            self.landscape_index = int(self._rng.integers(len(self._landscape_images)))
+        if mode in ("viola", JECA_MODE):
+            self._slide_next = self._next_slide_index()
+        # Fundo do caipira ja ajustado e escurecido, por (indice, largura, altura).
+        self._background_key: Optional[tuple[int, int, int]] = None
+        self._background: Optional[np.ndarray] = None
+        # Sem --hue, o matiz base e sorteado no xadrez e laranja no caipira.
+        if plaid_hue is None:
+            plaid_hue = (
+                CAIPIRA_HUE
+                if mode in ("caipira", "viola", JECATATU_MODE)
+                else float(self._rng.uniform(0.0, 360.0))
+            )
+        self.plaid_hue = plaid_hue % 360.0
         # Os padroes do xadrez (sett, fase de cada direcao e desvio de angulo, um
         # por camada do mix) sao sorteados ja aqui, em fracoes da altura do quadro,
         # e mantidos ao mudar densidade, rotacao e disposicao.
-        pattern_count = PLAID_PATTERN_COUNT if mode == "xadrez" else 0
+        pattern_count = (
+            PLAID_PATTERN_COUNT if mode in (*PLAID_MODES, "viola", JECATATU_MODE) else 0
+        )
         self._plaid_patterns = [
             (make_madras_sett(self._rng), tuple(self._rng.uniform(0.0, 1.0, 2).tolist()), angle)
             for angle in make_plaid_angle_offsets(self._rng, pattern_count)
@@ -2117,17 +2714,117 @@ class VisionProcessor:
             self._reset_mog2()
         elif mode == "conexoes":
             self._load_yolo(nogpu, int8)
+        elif mode in (ROLE_MODE, JECA_MODE):
+            self._segmenter = PersonSegmenter(nogpu)
+        elif mode == JECATATU_MODE:
+            self._segmenter = PersonSegmenter(nogpu)
+            try:
+                self._load_yolo(nogpu, int8)
+            except Exception as exc:
+                print(
+                    f"Aviso: sem YOLO de pose no {mode}, o xadrez nao reage aos contatos: {exc}",
+                    file=sys.stderr,
+                )
+        elif mode in ("caipira", "viola") and people_yolo:
+            try:
+                self._load_yolo(nogpu, int8)
+                self.people_count_yolo = 0
+            except Exception as exc:
+                print(
+                    f"Aviso: contagem de pessoas pelo YOLO desativada no {mode}: {exc}",
+                    file=sys.stderr,
+                )
 
     @property
     def label(self) -> str:
         if self.mode == "conexoes" and self._yolo_backend:
             return f"YOLOv8 Pose [{self._yolo_backend}]"
-        if self.mode == "xadrez":
+        if self.mode == "viola":
+            channels = " ".join(
+                f"canal{channel} {volume:.0%}"
+                for channel, volume in sorted(self.channel_volumes.items())
+                if volume > 0
+            )
             return (
-                f"Xadrez: dens. {self.plaid_density:.2f} | ganho {self.plaid_gain:.1f} | "
+                f"Viola: {self._landscape_images[self.landscape_index][0]}"
+                f" | pessoas {self._people_source} {self.people_count}"
+                + ("" if self.people_count_yolo is None else f" / YOLO {self.people_count_yolo}")
+                + f" | {channels or 'canais mudos'}"
+                + f" | {self.viola_blend}"
+                + (
+                    f" | desordem {self.line_disorder:.0%}"
+                    if self.viola_blend != "nenhuma"
+                    else ""
+                )
+                + (" | sem arpejos" if self.arpeggios is None else "")
+            )
+        if self.mode == JECATATU_MODE:
+            return (
+                f"Jecatatu [{self._segmenter.label}]: pessoas {self.people_count}"
+                f" | pontos {len(self._contacts)} | contatos {self.contact_count}"
+                f" | unioes {len(self._group_paintings)}"
+                f" | borda {self.role_edge}"
+                + (" | sem pose" if self._yolo is None else "")
+                + f" | {self._arpeggio_label()}"
+            )
+        if self.mode == JECA_MODE:
+            return (
+                f"Jeca [{self._segmenter.label}]: "
+                f"{self._landscape_images[self.landscape_index][0]}"
+                f" | pessoas {self.people_count} | borda {self.role_edge}"
+            )
+        if self.mode == ROLE_MODE:
+            channels = " ".join(
+                f"canal{channel} {volume:.0%}"
+                for channel, volume in sorted(self.channel_volumes.items())
+                if volume > 0
+            )
+            paintings = " ".join(
+                f"canal{player.slot}={self._landscape_images[player.painting][0]}"
+                for player in self._viola_players
+                if player.painting is not None
+            )
+            return (
+                f"Roda de viola [{self._segmenter.label}]: pessoas {self.people_count}"
+                + f" | borda {self.role_edge}"
+                + f" | {channels or 'canais mudos'}"
+                + (f" | {paintings}" if paintings else "")
+                + (" | sem arpejos" if self.arpeggios is None else "")
+            )
+        if self.mode in PLAID_MODES:
+            return (
+                f"{self.mode.capitalize()}: dens. {self.plaid_density:.2f} | "
+                f"ganho {self.plaid_gain:.1f} | "
                 f"rot. {self.plaid_rotation:.0f} | matiz {self.plaid_hue:.0f}"
                 + (" | silhueta" if self.silhouette else "")
                 + f" | {self.plaid_layout}"
+                + (
+                    f" | fundo {self._landscape_images[self.landscape_index][0]}"
+                    f" ({self.landscape_index + 1}/{len(self._landscape_images)})"
+                    if self.mode == "caipira"
+                    else ""
+                )
+                + (
+                    f" | desordem {self.line_disorder:.0%}"
+                    f" | pessoas {self._people_source} {self.people_count}"
+                    + (
+                        ""
+                        if self.people_count_yolo is None
+                        else f" / YOLO {self.people_count_yolo}"
+                    )
+                    + " | "
+                    + (
+                        " ".join(
+                            f"canal{channel} {volume:.0%}"
+                            for channel, volume in sorted(self.channel_volumes.items())
+                            if volume > 0
+                        )
+                        or "canais mudos"
+                    )
+                    + (" | sem toada" if self.arpeggios is None else "")
+                    if self.mode == "caipira"
+                    else ""
+                )
             )
         if self.mode == "paisagens":
             name = self._landscape_images[self.landscape_index][0]
@@ -2319,10 +3016,22 @@ class VisionProcessor:
             self._reset_mog2()
         elif self.mode == "optical_flow":
             self._previous_gray = None
-        elif self.mode in ("capim", "mato", "paisagens", "xadrez"):
+        elif self.mode in (
+            "capim", "mato", "paisagens", "viola", ROLE_MODE, JECA_MODE, JECATATU_MODE,
+            *PLAID_MODES,
+        ):
             # Mantem o capim/xadrez sorteado; um quadro de outro tamanho o recria.
             self._previous_gray = None
             self._field_clock = None
+            self._people_history.clear()
+            self.people_count = 0
+            self._people_yolo_history.clear()
+            self._viola_players = []
+            # Os canais da toada seguem decaindo; so o passo de tempo recomeca.
+            self._toada_clock = None
+            self._contacts = []
+            if self.people_count_yolo is not None:
+                self.people_count_yolo = 0
             if self._field is not None:
                 self._field.reset()
         elif self.mode == "conexoes":
@@ -2345,6 +3054,10 @@ class VisionProcessor:
         self, frame_bgr: np.ndarray, body_mask: Optional[np.ndarray] = None
     ) -> VisionResult:
         """body_mask e a mascara de profundidade do Kinect, quando a fonte e Kinect."""
+        if self.mode == JECA_MODE:
+            return self._process_jeca(frame_bgr, body_mask)
+        if self.mode == JECATATU_MODE:
+            return self._process_jecatatu(frame_bgr, body_mask)
         if self.mode == "mog2":
             height, width = frame_bgr.shape[:2]
             size = (
@@ -2363,7 +3076,9 @@ class VisionProcessor:
             cv2.drawContours(debug, contours, -1, (0, 255, 0), 1)
             return VisionResult(mask, debug, make_body_visual(mask))
 
-        if self.mode in ("optical_flow", "capim", "mato", "paisagens", "xadrez"):
+        if self.mode in (
+            "optical_flow", "capim", "mato", "paisagens", "viola", ROLE_MODE, *PLAID_MODES
+        ):
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             small_gray = cv2.resize(
                 gray,
@@ -2375,6 +3090,10 @@ class VisionProcessor:
             )
             if self.mode == "optical_flow":
                 result = self._process_flow(frame_bgr, small_gray)
+            elif self.mode == "viola":
+                result = self._process_viola(frame_bgr, small_gray, body_mask)
+            elif self.mode == ROLE_MODE:
+                result = self._process_role(frame_bgr, small_gray, body_mask)
             else:
                 result = self._process_field(frame_bgr, small_gray, body_mask)
             self._previous_gray = small_gray
@@ -2403,7 +3122,7 @@ class VisionProcessor:
             return LandscapeCanvas(width, height, image, self._crop_anchor(image), index)
         if self.mode == "mato":
             return MeadowField(width, height, self.meadow_density, self._rng)
-        if self.mode == "xadrez":
+        if self.mode in (*PLAID_MODES, "viola", JECATATU_MODE):
             return PlaidStack(
                 width,
                 height,
@@ -2411,7 +3130,8 @@ class VisionProcessor:
                 self.plaid_layout,
                 self.plaid_density,
                 self.plaid_rotation,
-                self.pulse_rate,
+                # No jecatatu os pulsos so saem dos contatos.
+                0.0 if self.mode == JECATATU_MODE else self.pulse_rate,
                 self._rng,
                 self.render,
             )
@@ -2442,12 +3162,1274 @@ class VisionProcessor:
             small = self._silhouette_mog2.apply(small_bgr)
         return self._clean_mask(small)
 
+    def _count_people(self, mask: np.ndarray) -> None:
+        """Conta os corpos da mascara da silhueta, ate CAIPIRA_MAX_PEOPLE."""
+        _, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        min_area = CAIPIRA_MIN_PERSON_AREA * mask.shape[0] * mask.shape[1]
+        bodies = stats[1:][stats[1:, cv2.CC_STAT_AREA] >= min_area]
+        self._people_history.append(min(len(bodies), CAIPIRA_MAX_PEOPLE))
+        self.people_count = sorted(self._people_history)[len(self._people_history) // 2]
+        self._people_boxes = [
+            (
+                round(x / SILHOUETTE_SCALE),
+                round(y / SILHOUETTE_SCALE),
+                round((x + w) / SILHOUETTE_SCALE),
+                round((y + h) / SILHOUETTE_SCALE),
+            )
+            for x, y, w, h in bodies[:, :4].tolist()
+        ]
+
+    def _count_people_yolo(self, frame_bgr: np.ndarray) -> None:
+        """Conta as pessoas detectadas pelo YOLO, ate CAIPIRA_MAX_PEOPLE."""
+        points, confidence = self._yolo_keypoints(frame_bgr)
+        self._people_yolo_history.append(min(len(points), CAIPIRA_MAX_PEOPLE))
+        history = sorted(self._people_yolo_history)
+        self.people_count_yolo = history[len(history) // 2]
+        # Caixa de cada pessoa: extremos dos keypoints confiaveis.
+        boxes = []
+        for index, person in enumerate(points):
+            if confidence is not None:
+                person = person[confidence[index] >= YOLO_MIN_KEYPOINT_CONFIDENCE]
+            if len(person):
+                (x0, y0), (x1, y1) = person.min(axis=0), person.max(axis=0)
+                boxes.append((round(x0), round(y0), round(x1), round(y1)))
+        self._people_yolo_boxes = boxes
+
+    def _track_players(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+        flow: Optional[np.ndarray],
+        scale: np.ndarray,
+        size: tuple[int, int],
+        slots: list[int],
+        random_slot: bool,
+    ) -> float:
+        """Rastreia as pessoas e da a cada nova um slot livre (par ou canal).
+
+        O slot e sorteado (random_slot) ou o menor livre; quem some por mais de
+        CAIPIRA_TRACK_GRACE o libera. Mede o movimento de quem esta no quadro e
+        devolve o instante do quadro.
+        """
+        now = self.clock()
+        self._viola_now = now
+        boxes = sorted(
+            boxes, key=lambda box: (box[2] - box[0]) * (box[3] - box[1]), reverse=True
+        )[:CAIPIRA_MAX_PEOPLE]
+        players = self._viola_players
+        # Associacao gulosa pela menor distancia entre centros.
+        max_jump = CAIPIRA_TRACK_MAX_JUMP * math.hypot(*size)
+        candidates = sorted(
+            (
+                math.hypot(
+                    player.center[0] - (box[0] + box[2]) / 2.0,
+                    player.center[1] - (box[1] + box[3]) / 2.0,
+                ),
+                player_index,
+                box_index,
+            )
+            for player_index, player in enumerate(players)
+            for box_index, box in enumerate(boxes)
+        )
+        matched_players, matched_boxes = set(), set()
+        for distance, player_index, box_index in candidates:
+            if distance > max_jump:
+                break
+            if player_index in matched_players or box_index in matched_boxes:
+                continue
+            players[player_index].place(boxes[box_index], now)
+            matched_players.add(player_index)
+            matched_boxes.add(box_index)
+        players = [player for player in players if now - player.seen <= CAIPIRA_TRACK_GRACE]
+        taken = {player.slot for player in players}
+        free = [slot for slot in sorted(slots) if slot not in taken]
+        for box_index, box in enumerate(boxes):
+            if box_index not in matched_boxes and free:
+                index = int(self._rng.integers(len(free))) if random_slot else 0
+                players.append(ViolaPlayer(box, free.pop(index), now))
+        magnitude = None if flow is None else np.hypot(flow[..., 0], flow[..., 1])
+        for player in players:
+            player.motion = 0.0
+            if magnitude is None or player.seen != now:
+                continue
+            x0, y0, x1, y1 = player.box
+            # Caixa na grade do fluxo; o movimento volta a px do quadro original.
+            cells = magnitude[
+                max(0, int(y0 * scale[1])) : max(1, int(math.ceil(y1 * scale[1]))),
+                max(0, int(x0 * scale[0])) : max(1, int(math.ceil(x1 * scale[0]))),
+            ]
+            if cells.size:
+                player.motion = float(cells.mean()) / float(scale[0])
+        self._viola_players = players
+        return now
+
+    def _play_toada(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+        flow: Optional[np.ndarray],
+        scale: np.ndarray,
+        size: tuple[int, int],
+        field: PlaidStack,
+    ) -> None:
+        """Caipira: da um canal sorteado a cada pessoa nova; as cordas que ela excita
+        sobem o volume do canal, que decai sem interacao."""
+        channels = (
+            sorted(self.arpeggios.channels)
+            if self.arpeggios is not None
+            else list(range(1, VIOLA_CHANNELS + 1))
+        )
+        now = self._track_players(boxes, flow, scale, size, channels, True)
+        dt = 0.0 if self._toada_clock is None else min(now - self._toada_clock, 0.1)
+        self._toada_clock = now
+        positions, moves = field.node_motion()
+        displacement = np.hypot(moves[:, 0], moves[:, 1])
+        excitations = {}
+        for player in self._viola_players:
+            player.excitation = 0.0
+            if player.seen != now:
+                continue
+            x0, y0, x1, y1 = player.box
+            inside = (
+                (positions[:, 0] >= x0) & (positions[:, 0] <= x1)
+                & (positions[:, 1] >= y0) & (positions[:, 1] <= y1)
+            )
+            if inside.any():
+                player.excitation = min(
+                    1.0, float(displacement[inside].mean()) / CAIPIRA_EXCITE_FULL_PX
+                )
+                excitations[player.slot] = player.excitation
+        decay = 0.5 ** (dt / CAIPIRA_VOLUME_HALF_LIFE)
+        for channel in channels:
+            level = self._toada_levels.get(channel, 0.0)
+            excitation = excitations.get(channel, 0.0)
+            if excitation >= CAIPIRA_EXCITE_MIN:
+                level = min(1.0, level + CAIPIRA_VOLUME_RISE * excitation * dt)
+                self._toada_excited[channel] = now
+            elif now - self._toada_excited.get(channel, -math.inf) > CAIPIRA_VOLUME_HOLD:
+                level *= decay
+                if level < CAIPIRA_VOLUME_FLOOR:
+                    level = 0.0
+            self._toada_levels[channel] = level
+        self.channel_volumes = {channel: self._toada_levels[channel] for channel in channels}
+        if self.arpeggios is not None:
+            for channel, volume in self.channel_volumes.items():
+                self.arpeggios.set_volume(channel, volume)
+
+    def _mix_arpeggios(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+        flow: Optional[np.ndarray],
+        scale: np.ndarray,
+        size: tuple[int, int],
+    ) -> None:
+        """Viola: cada pessoa liga o menor canal livre; o movimento aumenta o volume."""
+        channels = (
+            sorted(self.arpeggios.channels)
+            if self.arpeggios is not None
+            else list(range(1, VIOLA_CHANNELS + 1))
+        )
+        now = self._track_players(boxes, flow, scale, size, channels, False)
+        low, high = VIOLA_CHANNEL_VOLUME
+        volumes = dict.fromkeys(channels, 0.0)
+        for player in self._viola_players:
+            # Quem sumiu por pouco tempo mantem o nivel ate o rastreio desistir.
+            if player.seen == now:
+                level = min(1.0, player.motion / VIOLA_FULL_MOTION)
+                player.level += VIOLA_MOTION_SMOOTHING * (level - player.level)
+            volumes[player.slot] = low + (high - low) * player.level
+        self.channel_volumes = volumes
+        if self.arpeggios is not None:
+            for channel, volume in volumes.items():
+                self.arpeggios.set_volume(channel, volume)
+
+    def _slide(self, index: int, width: int, height: int, vivid: bool = False) -> np.ndarray:
+        """Pintura ajustada ao quadro (ou a versao viva), guardada por chave."""
+        key = (index, width, height, vivid)
+        if key not in self._slide_cache:
+            if vivid:
+                # Em HSV: saturacao multiplicada e brilho puxado para o maximo.
+                hue, saturation, value = cv2.split(
+                    cv2.cvtColor(self._slide(index, width, height), cv2.COLOR_BGR2HSV)
+                )
+                saturation = cv2.convertScaleAbs(saturation, alpha=VIOLA_VIVID_SATURATION)
+                value = cv2.convertScaleAbs(
+                    value, alpha=1.0 - VIOLA_VIVID_MIX, beta=255.0 * VIOLA_VIVID_MIX
+                )
+                self._slide_cache[key] = cv2.cvtColor(
+                    cv2.merge((hue, saturation, value)), cv2.COLOR_HSV2BGR
+                )
+            else:
+                image = self._landscape_images[index][1]
+                self._slide_cache[key] = fit_cover(
+                    image, width, height, self._crop_anchor(image)
+                )
+        return self._slide_cache[key]
+
+    def _prefetch_slide(self, index: int, width: int, height: int, vivid: bool) -> None:
+        """Prepara a proxima pintura numa thread, para a troca nao travar um quadro."""
+        key = (index, width, height, vivid)
+        if key in self._slide_cache or (
+            self._prefetch_thread is not None and self._prefetch_thread.is_alive()
+        ):
+            return
+        self._prefetch_thread = threading.Thread(
+            target=self._slide, args=(index, width, height, vivid), daemon=True
+        )
+        self._prefetch_thread.start()
+
+    def _next_slide_index(self) -> int:
+        """Proxima pintura numa ordem embaralhada, sem repetir a atual em seguida."""
+        if not self._slide_queue:
+            order = [int(index) for index in self._rng.permutation(len(self._landscape_images))]
+            if len(order) > 1 and order[0] == self.landscape_index:
+                order.append(order.pop(0))
+            self._slide_queue = order
+        return self._slide_queue.pop(0)
+
+    def skip_slide(self) -> None:
+        """Comeca ja a transicao para a proxima pintura (tecla i)."""
+        self._slide_skip = True
+
+    def _slide_state(self, now: float) -> tuple[int, int, float]:
+        """(pintura atual, seguinte, fade de 0 a 1): cada uma fica VIOLA_SLIDE_SECONDS
+        e passa a seguinte em VIOLA_FADE_SECONDS."""
+        if self._slide_start is None:
+            self._slide_start = now
+        if self._slide_skip:
+            self._slide_skip = False
+            self._slide_start = min(self._slide_start, now - VIOLA_SLIDE_SECONDS)
+        cycle = VIOLA_SLIDE_SECONDS + VIOLA_FADE_SECONDS
+        while now - self._slide_start >= cycle:
+            self._slide_start += cycle
+            self.landscape_index = self._slide_next
+            self._slide_next = self._next_slide_index()
+        fade = (now - self._slide_start - VIOLA_SLIDE_SECONDS) / VIOLA_FADE_SECONDS
+        return self.landscape_index, self._slide_next, min(1.0, max(0.0, fade))
+
+    def _compose_slides(
+        self, state: tuple[int, int, float], width: int, height: int, vivid: bool = False
+    ) -> np.ndarray:
+        """Pintura do quadro: a atual, ou o fade para a seguinte."""
+        current, following, fade = state
+        painting = self._slide(current, width, height, vivid)
+        if fade <= 0.0:
+            return painting.copy()
+        return cv2.addWeighted(
+            painting, 1.0 - fade, self._slide(following, width, height, vivid), fade, 0.0
+        )
+
+    def cycle_blend(self) -> None:
+        """Passa a proxima mescla (tecla e); o worker aplica no proximo quadro."""
+        index = VIOLA_BLENDS.index(self.viola_blend)
+        self.viola_blend = VIOLA_BLENDS[(index + 1) % len(VIOLA_BLENDS)]
+
+    def _blend_plaid(
+        self,
+        state: tuple[int, int, float],
+        flow: Optional[np.ndarray],
+        scale: np.ndarray,
+        width: int,
+        height: int,
+    ) -> np.ndarray:
+        """Xadrez do caipira mesclado as pinturas, conforme self.viola_blend."""
+        if (
+            self._field is None
+            or self._field.size != (width, height)
+            or self._field.layout
+            != (self.plaid_layout, self.plaid_density, self.plaid_rotation)
+        ):
+            self._field = self._make_field(width, height)
+        field = self._field
+        field.gain = self.plaid_gain
+        field.hue = self.plaid_hue
+        field.disorder_pulses = True
+        field.update(flow, scale, self.FLOW_THRESHOLD)
+        now = self._viola_now
+        dt = 0.0 if self._field_clock is None else min(now - self._field_clock, 0.1)
+        self._field_clock = now
+        field.advance(dt)
+        self.line_disorder = field.disorder
+        blend = self.viola_blend
+        if blend == "recorte":
+            painting = self._compose_slides(state, width, height)
+            shift = self._warp_shift(field, width, height)
+            if shift is None:
+                return painting
+            mask = np.zeros((height, width), dtype=np.uint8)
+            field.draw_mask(mask)
+            cv2.copyTo(self._apply_warp(painting, shift), mask, painting)
+            return painting
+        if blend in ("tecido", "quadros"):
+            shift = self._warp_shift(field, width, height)
+            if blend == "tecido":
+                painting = self._compose_slides(state, width, height)
+            else:
+                shift = self._lag_shift(field, shift, width, height)
+                painting = self._mosaic_slides(field, state, width, height)
+            body = cv2.convertScaleAbs(
+                self._apply_warp(painting, shift), alpha=VIOLA_TEXTILE_BRIGHTNESS
+            )
+            field.draw(body)
+            return body
+        # Janela e cores: as linhas (e os pulsos) viram a mascara de luz da pintura.
+        lines = np.zeros((height, width, 3), dtype=np.uint8)
+        field.draw(lines)
+        light = cv2.cvtColor(lines, cv2.COLOR_BGR2GRAY)
+        if blend == "cores":
+            # Linhas finas e tons escuros da paleta tambem acendem por inteiro.
+            light = cv2.convertScaleAbs(light, alpha=VIOLA_COLOR_LIGHT_GAIN)
+            painting = self._compose_slides(state, width, height, vivid=True)
+            background = VIOLA_COLOR_BACKGROUND
+        else:
+            painting = self._compose_slides(state, width, height)
+            background = VIOLA_WINDOW_BACKGROUND
+        lit = cv2.multiply(painting, cv2.cvtColor(light, cv2.COLOR_GRAY2BGR), scale=1.0 / 255.0)
+        return cv2.max(cv2.convertScaleAbs(painting, alpha=background), lit)
+
+    def _warp_shift(
+        self, field: PlaidStack, width: int, height: int
+    ) -> Optional[np.ndarray]:
+        """Deslocamento (grade, grade, 2) das linhas em celulas de VIOLA_WARP_CELL px,
+        ou None com a malha em repouso."""
+        positions, moves = field.node_motion()
+        if len(moves) == 0 or float(np.abs(moves).max()) < 0.05:
+            return None
+        cell = VIOLA_WARP_CELL
+        grid_width, grid_height = width // cell + 1, height // cell + 1
+        columns = np.clip((positions[:, 0] / cell).astype(np.intp), 0, grid_width - 1)
+        rows = np.clip((positions[:, 1] / cell).astype(np.intp), 0, grid_height - 1)
+        flat = rows * grid_width + columns
+        cells = grid_width * grid_height
+        # Soma dos deslocamentos e numero de nos por celula, espalhados pelo blur.
+        layers = [
+            np.bincount(flat, weights=weights, minlength=cells)
+            .reshape(grid_height, grid_width)
+            .astype(np.float32)
+            for weights in (moves[:, 0], moves[:, 1], None)
+        ]
+        spread = cv2.GaussianBlur(
+            np.dstack(layers), (0, 0), VIOLA_WARP_SIGMA, borderType=cv2.BORDER_REPLICATE
+        )
+        return spread[..., :2] / (spread[..., 2:] + 1e-3)
+
+    def _apply_warp(self, painting: np.ndarray, shift: Optional[np.ndarray]) -> np.ndarray:
+        """Deforma a pintura com o deslocamento da grade, num so remap."""
+        if shift is None:
+            return painting
+        height, width = painting.shape[:2]
+        grid_height, grid_width = shift.shape[:2]
+        # Mapa inverso montado na grade pequena e ampliado num so resize: cada pixel
+        # busca a cor de onde a linha veio. O resize bilinear reproduz exatamente as
+        # coordenadas da grade (lineares), sem somas em resolucao cheia.
+        if self._warp_size != (width, height, grid_width, grid_height):
+            centers_x = (np.arange(grid_width, dtype=np.float32) + 0.5) * (width / grid_width) - 0.5
+            centers_y = (
+                (np.arange(grid_height, dtype=np.float32) + 0.5) * (height / grid_height) - 0.5
+            )
+            self._warp_grid = np.dstack(np.meshgrid(centers_x, centers_y))
+            self._warp_size = (width, height, grid_width, grid_height)
+        warp_map = cv2.resize(
+            self._warp_grid - shift, (width, height), interpolation=cv2.INTER_LINEAR
+        )
+        return cv2.remap(painting, warp_map, None, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+    def _mosaic_cells(
+        self, field: PlaidStack, width: int, height: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Quadrado do xadrez de cada celula da grade e de cada pixel (0 a 255).
+
+        Calculado uma vez por malha (~ dezenas de ms em 720p), na malha mais proxima,
+        em repouso; quadrados distantes podem repetir o mesmo numero.
+        """
+        key = (id(field), width, height)
+        if self._mosaic_key == key:
+            return self._mosaic_maps
+        layer = field._layers[-1][0]
+        axes = []
+        for family in layer._families:
+            if len(family) == 0:
+                continue
+            rest = family._rest
+            direction = rest[0, -1] - rest[0, 0]
+            direction = direction / max(1e-6, float(np.hypot(*direction)))
+            normal = np.array((-direction[1], direction[0]), dtype=np.float32)
+            axes.append((normal, np.sort(rest[:, 0] @ normal)))
+
+        def cells_at(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+            code = np.zeros(x.shape, dtype=np.int64)
+            for factor, (normal, offsets) in zip((73856093, 19349663), axes):
+                band = np.searchsorted(offsets, x * normal[0] + y * normal[1])
+                code ^= band.astype(np.int64) * factor
+            return (code & 255).astype(np.uint8)
+
+        cell = VIOLA_WARP_CELL
+        grid_width, grid_height = width // cell + 1, height // cell + 1
+        grid_x, grid_y = np.meshgrid(
+            (np.arange(grid_width, dtype=np.float32) + 0.5) * (width / grid_width) - 0.5,
+            (np.arange(grid_height, dtype=np.float32) + 0.5) * (height / grid_height) - 0.5,
+        )
+        pixel_x, pixel_y = np.meshgrid(
+            np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32)
+        )
+        self._mosaic_maps = (cells_at(grid_x, grid_y), cells_at(pixel_x, pixel_y))
+        self._mosaic_key = key
+        self._mosaic_shift = None
+        return self._mosaic_maps
+
+    def _lag_shift(
+        self, field: PlaidStack, shift: Optional[np.ndarray], width: int, height: int
+    ) -> Optional[np.ndarray]:
+        """Quadros: cada quadrado segue o deslocamento com o seu proprio atraso."""
+        cells, _ = self._mosaic_cells(field, width, height)
+        target = np.zeros((*cells.shape, 2), np.float32) if shift is None else shift
+        if self._mosaic_shift is None or self._mosaic_shift.shape != target.shape:
+            self._mosaic_shift = np.zeros_like(target)
+        lagged = self._mosaic_shift
+        lagged += self._mosaic_rates[cells][..., None] * (target - lagged)
+        if float(np.abs(lagged).max()) < 0.05:
+            return None
+        return lagged
+
+    def _mosaic_slides(
+        self, field: PlaidStack, state: tuple[int, int, float], width: int, height: int
+    ) -> np.ndarray:
+        """Quadros: na troca, cada quadrado passa a pintura seguinte no seu momento."""
+        current, following, fade = state
+        if fade <= 0.0:
+            return self._slide(current, width, height)
+        if fade >= 1.0:
+            return self._slide(following, width, height)
+        _, pixels = self._mosaic_cells(field, width, height)
+        # Cada quadrado faz o seu fade em (1 - VIOLA_MOSAIC_STAGGER) do tempo, comecando
+        # num atraso sorteado; so nos quadros da troca.
+        weights = np.clip(
+            (fade - self._mosaic_offsets) / (1.0 - VIOLA_MOSAIC_STAGGER), 0.0, 1.0
+        )
+        alpha = cv2.LUT(pixels, (weights * 255.0).astype(np.uint8)).astype(np.float32)
+        alpha *= 1.0 / 255.0
+        return cv2.blendLinear(
+            self._slide(current, width, height),
+            self._slide(following, width, height),
+            1.0 - alpha,
+            alpha,
+        )
+
+    def _process_role(
+        self, frame_bgr: np.ndarray, gray: np.ndarray, body_mask: Optional[np.ndarray] = None
+    ) -> VisionResult:
+        """Roda de viola: silhuetas recortadas em paisagens sobre branco, com arpejos."""
+        height, width = frame_bgr.shape[:2]
+        flow = None if self._previous_gray is None else self._farneback(gray)
+        scale = np.array((gray.shape[1] / width, gray.shape[0] / height), dtype=np.float32)
+        boxes, masks = self._segmenter.people(frame_bgr)
+        self._people_source = "YOLO-seg"
+        self._people_history.append(min(len(boxes), CAIPIRA_MAX_PEOPLE))
+        self.people_count = sorted(self._people_history)[len(self._people_history) // 2]
+        self._people_yolo_boxes = boxes
+        self._mix_arpeggios(boxes, flow, scale, (width, height))
+        now = self._viola_now
+        self._assign_paintings()
+        self._update_silhouette_masks(boxes, masks, now, width, height)
+        body = self._role_canvas(width, height)
+        for player in self._viola_players:
+            self._paste_silhouette(body, player)
+        self._draw_strings(body, now)
+        debug = frame_bgr.copy()
+        self._draw_people_debug(debug)
+        return VisionResult(None, debug, body)
+
+    def _update_silhouette_masks(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+        masks: list[np.ndarray],
+        now: float,
+        width: int,
+        height: int,
+    ) -> None:
+        """Mascara de cada pessoa rastreada, em ROLE_ALPHA_SCALE, suavizada no tempo;
+        quem nao foi visto neste quadro vai apagando."""
+        small_size = (
+            max(1, round(width * ROLE_ALPHA_SCALE)),
+            max(1, round(height * ROLE_ALPHA_SCALE)),
+        )
+        detections = {box: mask for box, mask in zip(boxes, masks)}
+        for player in self._viola_players:
+            mask = detections.get(player.box) if player.seen == now else None
+            target = (
+                np.zeros(small_size[::-1], np.float32)
+                if mask is None
+                else cv2.resize(
+                    mask,
+                    small_size,
+                    interpolation=cv2.INTER_LINEAR
+                    if self.role_edge == "suave"
+                    else cv2.INTER_NEAREST,
+                )
+            )
+            if player.alpha is None or player.alpha.shape != target.shape:
+                player.alpha = target
+            else:
+                player.alpha += ROLE_MASK_SMOOTHING * (target - player.alpha)
+
+    def _string_anchors(self, player: ViolaPlayer) -> np.ndarray:
+        """ROLE_STRING_COUNT pontos sorteados dentro da silhueta, relativos a caixa."""
+        x0, y0, x1, y1 = player.box
+        size = np.array((max(1, x1 - x0), max(1, y1 - y0)), dtype=np.float32)
+        if player.alpha is not None:
+            rows, columns = np.nonzero(player.alpha >= 0.5)
+            points = (np.stack((columns, rows), axis=1).astype(np.float32) + 0.5) / ROLE_ALPHA_SCALE
+            inside = np.all((points >= (x0, y0)) & (points <= (x1, y1)), axis=1)
+            points = points[inside]
+            if len(points) >= ROLE_STRING_COUNT:
+                chosen = points[self._rng.choice(len(points), ROLE_STRING_COUNT, replace=False)]
+                return (chosen - (x0, y0)) / size
+        return self._rng.uniform(0.2, 0.8, (ROLE_STRING_COUNT, 2)).astype(np.float32)
+
+    def _draw_strings(self, body: np.ndarray, now: float) -> None:
+        """Liga cada pessoa a cada outra por cordas finas, com pontas espalhadas pelas
+        silhuetas, que vibram mais quando os corpos estao perto."""
+        players = [
+            player
+            for player in self._viola_players
+            if now - player.seen <= ROLE_STRING_HOLD
+        ]
+        anchors_by_pair = {}
+        if len(players) < 2:
+            self._string_pairs = anchors_by_pair
+            return
+        height, width = body.shape[:2]
+        diagonal = math.hypot(width, height)
+        t = np.linspace(0.0, 1.0, ROLE_STRING_SAMPLES, dtype=np.float32)[None, :, None]
+        slow, fast = ROLE_STRING_HZ
+        # Modo de cada corda (metade fundamental, metade oitava) e fase propria.
+        harmonics = np.where(np.arange(ROLE_STRING_COUNT) % 2 == 0, 1.0, 2.0).astype(np.float32)
+        strings = []
+        for first in range(len(players)):
+            for second in range(first + 1, len(players)):
+                one, other = players[first], players[second]
+                key = (id(one), id(other))
+                anchors = self._string_pairs.get(key)
+                if anchors is None:
+                    anchors = (self._string_anchors(one), self._string_anchors(other))
+                anchors_by_pair[key] = anchors
+                ends = []
+                for player, relative in zip((one, other), anchors):
+                    x0, y0, x1, y1 = player.box
+                    ends.append(
+                        np.array((x0, y0), np.float32)
+                        + relative * np.array((max(1, x1 - x0), max(1, y1 - y0)), np.float32)
+                    )
+                start, end = ends
+                along = end - start
+                lengths = np.maximum(np.hypot(along[:, 0], along[:, 1]), 1.0)[:, None]
+                normals = np.stack((-along[:, 1], along[:, 0]), axis=1) / lengths
+                # Proximidade pelos centros dos corpos: o feixe todo vibra junto.
+                gap = math.hypot(one.center[0] - other.center[0], one.center[1] - other.center[1])
+                closeness = min(
+                    1.0,
+                    max(0.0, (ROLE_STRING_FAR - gap / diagonal) / (ROLE_STRING_FAR - ROLE_STRING_NEAR)),
+                )
+                amplitude = ROLE_STRING_AMPLITUDE * height * (
+                    ROLE_STRING_IDLE + (1.0 - ROLE_STRING_IDLE) * closeness
+                )
+                frequency = slow + (fast - slow) * closeness
+                phases = (one.slot * 7 + other.slot * 13 + np.arange(ROLE_STRING_COUNT) * 1.3) % (
+                    2.0 * math.pi
+                )
+                swing = np.sin(2.0 * math.pi * frequency * harmonics * now + phases)
+                wave = (
+                    (amplitude / harmonics * swing)[:, None, None]
+                    * np.sin(math.pi * harmonics[:, None, None] * t)
+                    * normals[:, None, :]
+                )
+                curves = start[:, None, :] + along[:, None, :] * t + wave
+                strings.extend(np.rint(curves).astype(np.int32))
+        self._string_pairs = anchors_by_pair
+        if not strings:
+            return
+        # Fios de 1 px como tinta semitransparente, so na regiao das cordas.
+        points = np.concatenate(strings)
+        x0, y0 = np.maximum(0, points.min(axis=0) - 2)
+        x1, y1 = np.minimum((width, height), points.max(axis=0) + 3)
+        if x1 <= x0 or y1 <= y0:
+            return
+        ink = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        cv2.polylines(ink, [curve - (x0, y0) for curve in strings], False, 255, 1, cv2.LINE_AA)
+        keep = cv2.convertScaleAbs(ink, alpha=-ROLE_STRING_OPACITY, beta=255.0)
+        region = body[y0:y1, x0:x1]
+        body[y0:y1, x0:x1] = cv2.multiply(
+            region, cv2.cvtColor(keep, cv2.COLOR_GRAY2BGR), scale=1.0 / 255.0
+        )
+
+    def _role_canvas(self, width: int, height: int) -> np.ndarray:
+        """Fundo branco do quadro (copiado de um guardado)."""
+        if self._white is None or self._white.shape[:2] != (height, width):
+            self._white = np.full((height, width, 3), 255, np.uint8)
+        return self._white.copy()
+
+    def cycle_role_edge(self) -> None:
+        """Passa ao proximo estilo de borda das silhuetas (tecla e)."""
+        index = ROLE_EDGE_STYLES.index(self.role_edge)
+        self.role_edge = ROLE_EDGE_STYLES[(index + 1) % len(ROLE_EDGE_STYLES)]
+
+    def _paste_silhouette(self, body: np.ndarray, player: ViolaPlayer) -> None:
+        """Compoe a silhueta da pessoa, so dentro da caixa dela: a paisagem dela (roda)
+        ou o xadrez dela, com os vaos transparentes (jeca)."""
+        height, width = body.shape[:2]
+        region = self._silhouette_region(player, width, height)
+        if region is None:
+            return
+        x0, y0, x1, y1, cover = region
+        if self.mode == JECA_MODE:
+            source, pattern = self._plaid_patch(player, x0, y0, x1, y1, width, height)
+            if cover.dtype == bool:
+                cover = cover & pattern
+            else:
+                cover = cover * pattern
+        else:
+            if player.painting is None:
+                return
+            source = self._slide(player.painting, width, height)[y0:y1, x0:x1]
+        if cover.dtype == bool:
+            # cv2.copyTo grava direto na regiao (~50x mais rapido que np.copyto com where).
+            cv2.copyTo(source, cover.view(np.uint8), body[y0:y1, x0:x1])
+        else:
+            body[y0:y1, x0:x1] = cv2.blendLinear(body[y0:y1, x0:x1], source, 1.0 - cover, cover)
+
+    def _silhouette_region(
+        self, player: ViolaPlayer, width: int, height: int
+    ) -> Optional[tuple[int, int, int, int, np.ndarray]]:
+        """(x0, y0, x1, y1, cobertura) da silhueta no quadro: cobertura booleana nas
+        bordas duras (poligono, serrilhado) ou peso de 0 a 1 na suave."""
+        if player.alpha is None:
+            return None
+        style = self.role_edge
+        if style == "suave":
+            alpha = cv2.GaussianBlur(player.alpha, (0, 0), ROLE_EDGE_SIGMA * ROLE_ALPHA_SCALE)
+        else:
+            alpha = (player.alpha >= 0.5).astype(np.uint8)
+        if style == "poligono":
+            return self._polygon_region(alpha, player, width, height)
+        x, y, box_width, box_height = cv2.boundingRect((alpha > 0.01).astype(np.uint8))
+        if box_width == 0 or box_height == 0:
+            return None
+        x0 = int(x / ROLE_ALPHA_SCALE)
+        y0 = int(y / ROLE_ALPHA_SCALE)
+        x1 = min(width, int(math.ceil((x + box_width) / ROLE_ALPHA_SCALE)))
+        y1 = min(height, int(math.ceil((y + box_height) / ROLE_ALPHA_SCALE)))
+        crop = alpha[y : y + box_height, x : x + box_width]
+        if style == "serrilhado":
+            cover = cv2.resize(crop, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST)
+            return x0, y0, x1, y1, cover.astype(bool)
+        weight = cv2.resize(crop, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
+        np.clip(weight, 0.0, 1.0, out=weight)
+        return x0, y0, x1, y1, weight
+
+    def _polygon_region(
+        self, alpha: np.ndarray, player: ViolaPlayer, width: int, height: int
+    ) -> Optional[tuple[int, int, int, int, np.ndarray]]:
+        """Poligono: contorno externo simplificado em poucos lados retos e preenchido.
+
+        O poligono de cada pessoa e mantido entre quadros: enquanto a forma nova so
+        difere da atual pelo ruido da mascara ou por um deslocamento, as facetas
+        ficam e so acompanham o corpo; elas so sao refeitas quando a pose muda.
+        """
+        contours, _ = cv2.findContours(alpha, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Tolerancia e area minima na escala da mascara pequena.
+        epsilon = ROLE_POLYGON_EPSILON * alpha.shape[0]
+        min_area = ROLE_POLYGON_MIN_AREA * alpha.size
+        fresh = [
+            cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2).astype(np.float32)
+            for contour in contours
+            if cv2.contourArea(contour) >= min_area
+        ]
+        if not fresh:
+            player.polygons = None
+            return None
+        # Centro da mascara (ja suavizada no tempo): referencia de posicao menos ruidosa
+        # que o centro do poligono, que muda com a escolha dos vertices.
+        moments = cv2.moments(alpha, True)
+        if moments["m00"] == 0:
+            player.polygons = None
+            return None
+        center = np.array(
+            (moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]), dtype=np.float32
+        )
+        polygons = fresh
+        if player.polygons is not None:
+            # Zona morta continua: sob o ruido a posicao nao muda; acima dela, as
+            # facetas seguem o corpo continuamente, atrasadas so pela margem.
+            drift = center - player.polygon_center
+            distance = float(np.hypot(*drift))
+            if distance > ROLE_POLYGON_DEADBAND:
+                step = drift * (1.0 - ROLE_POLYGON_DEADBAND / distance)
+                player.polygons = [polygon + step for polygon in player.polygons]
+                player.polygon_center = player.polygon_center + step
+            held = player.polygons
+            fresh_area = self._raster_polygons(fresh, alpha.shape)
+            held_area = self._raster_polygons(held, alpha.shape)
+            union = cv2.countNonZero(cv2.bitwise_or(fresh_area, held_area))
+            overlap = cv2.countNonZero(cv2.bitwise_and(fresh_area, held_area))
+            if union and overlap / union >= ROLE_POLYGON_HOLD_IOU:
+                polygons = held
+        if polygons is fresh:
+            player.polygon_center = center
+        player.polygons = polygons
+        polygons = [(polygon + 0.5) / ROLE_ALPHA_SCALE for polygon in polygons]
+        points = np.concatenate(polygons)
+        x0, y0 = np.maximum(0, np.floor(points.min(axis=0)).astype(int))
+        x1, y1 = np.minimum((width, height), np.ceil(points.max(axis=0)).astype(int) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        inside = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        cv2.fillPoly(
+            inside,
+            [np.round(polygon - (x0, y0)).astype(np.int32) for polygon in polygons],
+            1,
+            cv2.LINE_8,
+        )
+        return int(x0), int(y0), int(x1), int(y1), inside.astype(bool)
+
+    def _plaid_patch(
+        self,
+        player: ViolaPlayer,
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+        width: int,
+        height: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Cores e linhas (booleano) do xadrez da pessoa na regiao dada.
+
+        O tecido, girado no angulo fixo da pessoa, e desenhado uma vez do tamanho do
+        quadro mais uma margem de um periodo na diagonal. O xadrez acompanha o corpo
+        como uma roupa: o deslocamento e reduzido a um periodo nos eixos do padrao
+        (que se repete neles), e a regiao e um recorte do tecido, sem copia.
+        """
+        if player.plaid is None or player.plaid[4] != (width, height):
+            period, stripes, palette = make_jeca_plaid(
+                self._rng, JECA_PLAID_HUES[(player.slot - 1) % len(JECA_PLAID_HUES)], height
+            )
+            lattice, angle = jeca_plaid_lattice(period, float(self._rng.uniform(0.0, 180.0)))
+            margin = math.ceil(float(np.hypot(*lattice)) * math.sqrt(2.0)) + 2
+            colors, lines = render_jeca_plaid(
+                period, stripes, palette, lattice, width + 2 * margin, height + 2 * margin
+            )
+            player.plaid = (colors, lines, lattice, margin, (width, height), angle)
+            player.plaid_origin = np.array(player.center, dtype=np.float32)
+            player.plaid_offset = np.zeros(2, dtype=np.float32)
+        colors, lines, lattice, margin, _, _ = player.plaid
+        # Deslocamento do corpo desde que o xadrez nasceu, com zona morta.
+        drift = np.array(player.center, dtype=np.float32) - player.plaid_origin - player.plaid_offset
+        distance = float(np.hypot(*drift))
+        if distance > JECA_PLAID_DEADBAND:
+            player.plaid_offset += drift * (1.0 - JECA_PLAID_DEADBAND / distance)
+        # Reduz o deslocamento (inteiro) a uma celula da rede do padrao, subtraindo
+        # multiplos inteiros dos vetores (a, b) e (-b, a): o resto tem |resto| <= passo
+        # * raiz 2 e o recorte e exatamente o mesmo.
+        offset = np.rint(player.plaid_offset).astype(int)
+        a, b = int(lattice[0]), int(lattice[1])
+        norm = a * a + b * b
+        along = math.floor((offset[0] * a + offset[1] * b) / norm)
+        across = math.floor((-offset[0] * b + offset[1] * a) / norm)
+        reduced = offset - along * np.array((a, b)) - across * np.array((-b, a))
+        shift_x, shift_y = margin - reduced
+        rows = slice(y0 + shift_y, y1 + shift_y)
+        columns = slice(x0 + shift_x, x1 + shift_x)
+        return colors[rows, columns], lines[rows, columns]
+
+    def _assign_paintings(self) -> None:
+        """Paisagem de cada pessoa nova: sorteada entre as que ninguem usa, e fixa."""
+        used = {player.painting for player in self._viola_players}
+        for player in self._viola_players:
+            if player.painting is None:
+                free = [
+                    index for index in range(len(self._landscape_images)) if index not in used
+                ] or list(range(len(self._landscape_images)))
+                player.painting = free[int(self._rng.integers(len(free)))]
+                used.add(player.painting)
+
+    def _extremities(self, frame_bgr: np.ndarray, now: float) -> list[tuple[str, np.ndarray, int]]:
+        """Cabeca, maos e pes de cada pessoa (pontos confiaveis do YOLO de pose), com a
+        silhueta (slot) a que pertencem.
+
+        Uma pose so conta se o centro dos seus pontos cair dentro da caixa de uma
+        silhueta, e cada silhueta fica com uma pose so, a mais confiante; poses com
+        confianca media abaixo de JECATATU_POSE_CONFIDENCE (fantasmas do fundo) saem.
+        """
+        if self._yolo is None:
+            return []
+        points, confidence = self._yolo_keypoints(frame_bgr)
+        players = [player for player in self._viola_players if player.seen == now]
+        chosen: dict[int, tuple[float, int]] = {}
+        for index, person in enumerate(points[:YOLO_MAX_DETECTIONS]):
+            score = 1.0 if confidence is None else float(confidence[index].mean())
+            reliable = (
+                person
+                if confidence is None
+                else person[confidence[index] >= YOLO_MIN_KEYPOINT_CONFIDENCE]
+            )
+            if score < JECATATU_POSE_CONFIDENCE or len(reliable) == 0:
+                continue
+            center = reliable.mean(axis=0)
+            inside = [
+                player
+                for player in players
+                if player.box[0] <= center[0] <= player.box[2]
+                and player.box[1] <= center[1] <= player.box[3]
+            ]
+            if not inside:
+                continue
+            slot = min(
+                inside,
+                key=lambda player: math.hypot(
+                    center[0] - player.center[0], center[1] - player.center[1]
+                ),
+            ).slot
+            if slot not in chosen or score > chosen[slot][0]:
+                chosen[slot] = (score, index)
+        found = []
+        for slot, (_, index) in chosen.items():
+            person = points[index]
+            for part, keypoints in JECATATU_KEYPOINTS:
+                keypoints = list(keypoints)
+                if confidence is not None:
+                    keypoints = [
+                        k for k in keypoints if confidence[index, k] >= YOLO_MIN_KEYPOINT_CONFIDENCE
+                    ]
+                if keypoints:
+                    found.append((part, person[keypoints].mean(axis=0).astype(np.float32), slot))
+        return found
+
+    def _update_contacts(
+        self, extremities: list[tuple[str, np.ndarray, int]], now: float, width: int, height: int
+    ) -> list[dict]:
+        """Liga cada ponto ao do quadro anterior (mesma parte, o mais perto) e devolve
+        os contatos: gestos rapidos, com rearme e intervalo minimo."""
+        previous = self._contacts
+        max_jump = JECATATU_CONTACT_JUMP * math.hypot(width, height)
+        unit = height / 720.0
+        used: set[int] = set()
+        current = []
+        for part, point, slot in extremities:
+            best, best_distance = None, max_jump
+            for index, contact in enumerate(previous):
+                if index in used or contact["part"] != part or contact["slot"] != slot:
+                    continue
+                distance = float(np.hypot(*(point - contact["point"])))
+                if distance < best_distance:
+                    best, best_distance = index, distance
+            if best is None:
+                current.append(
+                    {"part": part, "slot": slot, "point": point, "steps": [],
+                     "velocity": np.zeros(2, np.float32), "armed": True, "last": -math.inf}
+                )
+            else:
+                used.add(best)
+                old = previous[best]
+                # Velocidade robusta: mediana dos ultimos passos, que descarta um salto
+                # isolado do modelo de pose; um gesto brusco de verdade dura mais.
+                steps = (old["steps"] + [point - old["point"]])[-JECATATU_VELOCITY_FRAMES:]
+                current.append(
+                    {"part": part, "slot": slot, "point": point, "steps": steps,
+                     "velocity": np.median(np.array(steps), axis=0).astype(np.float32),
+                     "armed": old["armed"], "last": old["last"]}
+                )
+        events = []
+        for contact in current:
+            speed = float(np.hypot(*contact["velocity"])) / unit
+            contact["speed"] = speed
+            if speed < JECATATU_CONTACT_RELEASE:
+                contact["armed"] = True
+            elif (
+                contact["armed"]
+                and speed >= JECATATU_CONTACT_SPEED
+                and now - contact["last"] >= JECATATU_CONTACT_COOLDOWN
+            ):
+                contact["armed"] = False
+                contact["last"] = now
+                events.append(contact)
+        self._contacts = current
+        return events
+
+    def _contact_flow(self, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
+        """Campo de fluxo sintetico (grade do optical flow) com a velocidade de cada
+        ponto de contato espalhada num raio: e o que empurra as linhas."""
+        grid_width = max(1, int(width * self.FLOW_SCALE))
+        grid_height = max(1, int(height * self.FLOW_SCALE))
+        flow = np.zeros((grid_height, grid_width, 2), dtype=np.float32)
+        radius = max(1, round(JECATATU_PUSH_RADIUS * height * self.FLOW_SCALE))
+        unit = height / 720.0
+        for contact in self._contacts:
+            velocity = contact["velocity"]
+            if float(np.hypot(*velocity)) < JECATATU_PUSH_MIN * unit:
+                continue
+            push = velocity * (self.FLOW_SCALE * JECATATU_PUSH_GAIN)
+            center = tuple(int(round(value * self.FLOW_SCALE)) for value in contact["point"])
+            cv2.circle(flow, center, radius, (float(push[0]), float(push[1])), -1)
+        if radius > 1:
+            flow = cv2.GaussianBlur(flow, (0, 0), radius / 2.0)
+        scale = np.array((grid_width / width, grid_height / height), dtype=np.float32)
+        return flow, scale
+
+    def _process_jecatatu(
+        self, frame_bgr: np.ndarray, body_mask: Optional[np.ndarray] = None
+    ) -> VisionResult:
+        """Jecatatu: silhuetas em paisagens sobre preto, xadrez por cima reagindo a
+        cabeca, maos e pes; cada contato faz a silhueta brilhar. Cada pessoa toca o seu
+        arpejo no seu tempo; silhuetas fundidas sincronizam."""
+        height, width = frame_bgr.shape[:2]
+        boxes, masks = self._segmenter.people(frame_bgr)
+        self._people_source = "YOLO-seg"
+        self._people_history.append(min(len(boxes), CAIPIRA_MAX_PEOPLE))
+        self.people_count = sorted(self._people_history)[len(self._people_history) // 2]
+        self._people_yolo_boxes = boxes
+        now = self._track_players(
+            boxes, None, np.ones(2, np.float32), (width, height),
+            list(range(1, CAIPIRA_MAX_PEOPLE + 1)), False,
+        )
+        self._assign_paintings()
+        self._update_silhouette_masks(boxes, masks, now, width, height)
+        events = self._update_contacts(self._extremities(frame_bgr, now), now, width, height)
+        if (
+            self._field is None
+            or self._field.size != (width, height)
+            or self._field.layout != (self.plaid_layout, self.plaid_density, self.plaid_rotation)
+        ):
+            self._field = self._make_field(width, height)
+        field = self._field
+        field.gain = self.plaid_gain
+        field.hue = self.plaid_hue
+        flow, scale = self._contact_flow(width, height)
+        field.update(flow, scale, self.FLOW_THRESHOLD)
+        unit = height / 720.0
+        lit = {contact["slot"] for contact in events}
+        self.contact_count += len(events)
+        dt = 0.0 if self._field_clock is None else min(now - self._field_clock, 0.1)
+        self._field_clock = now
+        fade = math.exp(-dt / JECATATU_GLOW_SECONDS)
+        for player in self._viola_players:
+            player.glow = 1.0 if player.slot in lit else player.glow * fade
+        if self._black is None or self._black.shape[:2] != (height, width):
+            self._black = np.full((height, width, 3), JECATATU_BACKGROUND, np.uint8)
+        body = self._black.copy()
+        groups = self._silhouette_groups(height)
+        for group in groups:
+            if len(group) == 1:
+                self._paste_silhouette(body, group[0])
+            else:
+                self._paste_group(body, group)
+        self._play_group_arpeggios(groups)
+        field.draw(body)
+        for player in self._viola_players:
+            if player.glow > 0.02:
+                self._draw_glow(body, player)
+        debug = frame_bgr.copy()
+        self._draw_people_debug(debug)
+        for contact in self._contacts:
+            point = tuple(int(round(value)) for value in contact["point"])
+            color = JECATATU_PART_COLORS[contact["part"]]
+            cv2.circle(debug, point, max(4, round(6 * unit)), color, -1, cv2.LINE_AA)
+            if now - contact["last"] < 0.25:
+                cv2.circle(debug, point, max(10, round(22 * unit)), color, 3, cv2.LINE_AA)
+        return VisionResult(None, debug, body)
+
+    def _draw_glow(self, body: np.ndarray, player: ViolaPlayer) -> None:
+        """Brilho que sai da silhueta: a mascara desfocada e colorida, somada por cima de
+        tudo, so na regiao da pessoa. Calculado em 8 bits e em JECATATU_GLOW_SCALE da
+        mascara pequena (o brilho e difuso), e so ampliado para compor."""
+        if player.alpha is None:
+            return
+        height, width = body.shape[:2]
+        mask = (player.alpha >= 0.5).astype(np.uint8) * 255
+        x, y, box_width, box_height = cv2.boundingRect(mask)
+        if box_width == 0 or box_height == 0:
+            return
+        sigma = max(1.0, JECATATU_GLOW_RADIUS * height * ROLE_ALPHA_SCALE)
+        reach = int(math.ceil(3 * sigma))
+        sx0, sy0 = max(0, x - reach), max(0, y - reach)
+        sx1 = min(mask.shape[1], x + box_width + reach)
+        sy1 = min(mask.shape[0], y + box_height + reach)
+        crop = mask[sy0:sy1, sx0:sx1]
+        small = cv2.resize(
+            crop,
+            (max(1, round(crop.shape[1] * JECATATU_GLOW_SCALE)), max(1, round(crop.shape[0] * JECATATU_GLOW_SCALE))),
+            interpolation=cv2.INTER_AREA,
+        )
+        halo = cv2.GaussianBlur(small, (0, 0), max(0.8, sigma * JECATATU_GLOW_SCALE))
+        # A luz sai do corpo: forte em volta, so JECATATU_GLOW_INSIDE dela por dentro,
+        # para clarear a paisagem sem apaga-la.
+        halo = cv2.subtract(
+            halo, cv2.multiply(halo, small, scale=(1.0 - JECATATU_GLOW_INSIDE) / 255.0)
+        )
+        pure = np.array(plaid_palette(self.plaid_hue)[0], dtype=np.float64)
+        color = (pure + JECATATU_GLOW_WHITE * (255.0 - pure)) * (JECATATU_GLOW_GAIN * player.glow)
+        light = cv2.multiply(
+            cv2.cvtColor(halo, cv2.COLOR_GRAY2BGR), (*color.tolist(), 0.0), scale=1.0 / 255.0
+        )
+        x0, y0 = int(sx0 / ROLE_ALPHA_SCALE), int(sy0 / ROLE_ALPHA_SCALE)
+        x1 = min(width, int(math.ceil(sx1 / ROLE_ALPHA_SCALE)))
+        y1 = min(height, int(math.ceil(sy1 / ROLE_ALPHA_SCALE)))
+        light = cv2.resize(light, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
+        region = body[y0:y1, x0:x1]
+        cv2.add(region, light, dst=region)
+
+    def _play_group_arpeggios(self, groups: list[list[ViolaPlayer]]) -> None:
+        """Cada pessoa toca o seu canal; um grupo fundido segue o tempo do menor canal."""
+        if self.arpeggios is None:
+            return
+        present = set()
+        for group in groups:
+            leader = min(player.slot for player in group)
+            for player in group:
+                present.add(player.slot)
+                self.arpeggios.follow(player.slot, leader)
+        for channel in self.arpeggios.channels:
+            self.arpeggios.set_volume(
+                channel, JECATATU_ARPEGGIO_VOLUME if channel in present else 0.0
+            )
+
+    def _arpeggio_label(self) -> str:
+        """Canais tocando, juntando os que estao no mesmo tempo (ex.: 1+3 2)."""
+        if self.arpeggios is None:
+            return "sem arpejos"
+        tempos: dict[int, list[int]] = {}
+        for channel, volume in sorted(self.arpeggios.volumes.items()):
+            if volume > 0:
+                tempos.setdefault(self.arpeggios.leader_of(channel), []).append(channel)
+        if not tempos:
+            return "arpejos mudos"
+        return "arpejos " + " ".join(
+            "+".join(str(channel) for channel in channels) for channels in tempos.values()
+        )
+
+    def _silhouette_groups(self, height: int) -> list[list[ViolaPlayer]]:
+        """Pessoas agrupadas pelas silhuetas que se tocam (com folga para separar)."""
+        players = [player for player in self._viola_players if player.alpha is not None]
+        masks = [(player.alpha >= 0.5).astype(np.uint8) for player in players]
+        boxes = [cv2.boundingRect(mask) for mask in masks]
+        near = JECATATU_MERGE_DISTANCE * height * ROLE_ALPHA_SCALE
+        far = JECATATU_SPLIT_DISTANCE * height * ROLE_ALPHA_SCALE
+        merged = set()
+        for first in range(len(players)):
+            for second in range(first + 1, len(players)):
+                pair = tuple(sorted((players[first].slot, players[second].slot)))
+                limit = far if pair in self._merged_pairs else near
+                gap = self._mask_gap(masks[first], boxes[first], masks[second], boxes[second], limit)
+                if gap is not None and gap <= limit:
+                    merged.add(pair)
+        self._merged_pairs = merged
+        # Componentes conexos dos pares somados (union-find pelos slots).
+        parent = {player.slot: player.slot for player in players}
+
+        def root(slot: int) -> int:
+            while parent[slot] != slot:
+                parent[slot] = parent[parent[slot]]
+                slot = parent[slot]
+            return slot
+
+        for first, second in merged:
+            parent[root(first)] = root(second)
+        groups: dict[int, list[ViolaPlayer]] = {}
+        for player in players:
+            groups.setdefault(root(player.slot), []).append(player)
+        # Paisagem de cada grupo novo: uma que nenhuma pessoa nem grupo visivel usa.
+        current = {frozenset(player.slot for player in group) for group in groups.values() if len(group) > 1}
+        self._group_paintings = {
+            key: painting for key, painting in self._group_paintings.items() if key in current
+        }
+        self._group_shapes = {
+            key: shape for key, shape in self._group_shapes.items() if key in current
+        }
+        for key in current:
+            if key not in self._group_paintings:
+                used = {player.painting for player in players} | set(self._group_paintings.values())
+                free = [
+                    index for index in range(len(self._landscape_images)) if index not in used
+                ] or list(range(len(self._landscape_images)))
+                self._group_paintings[key] = free[int(self._rng.integers(len(free)))]
+        return list(groups.values())
+
+    @staticmethod
+    def _mask_gap(
+        first: np.ndarray,
+        first_box: tuple[int, int, int, int],
+        second: np.ndarray,
+        second_box: tuple[int, int, int, int],
+        limit: float,
+    ) -> Optional[float]:
+        """Menor distancia (px da mascara pequena) entre duas mascaras, se for ate limit;
+        None se as caixas, alargadas por limit, nem se encostam. So a regiao entre as
+        duas e examinada."""
+        reach = int(math.ceil(limit)) + 1
+        x0 = max(first_box[0], second_box[0]) - reach
+        y0 = max(first_box[1], second_box[1]) - reach
+        x1 = min(first_box[0] + first_box[2], second_box[0] + second_box[2]) + reach
+        y1 = min(first_box[1] + first_box[3], second_box[1] + second_box[3]) + reach
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(first.shape[1], x1), min(first.shape[0], y1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        first_crop = first[y0:y1, x0:x1]
+        second_crop = second[y0:y1, x0:x1]
+        if not first_crop.any() or not second_crop.any():
+            return None
+        # Distancia de cada pixel ao pixel mais proximo da primeira mascara.
+        distance = cv2.distanceTransform((first_crop == 0).astype(np.uint8), cv2.DIST_L2, 3)
+        return float(distance[second_crop > 0].min())
+
+    def _paste_group(self, body: np.ndarray, group: list[ViolaPlayer]) -> None:
+        """Silhuetas somadas numa forma so, preenchida pela paisagem do grupo.
+
+        As mascaras das pessoas sao unidas e fechadas (dilata e erode, MORPH_CLOSE):
+        os vaos mais estreitos que a distancia de separacao viram uma ponte entre os
+        corpos. O resultado vira um poligono so, estabilizado como os das pessoas;
+        e uma fusao aproximada, que tambem preenche reentrancias pequenas da forma.
+        """
+        height, width = body.shape[:2]
+        masks = [player.alpha for player in group if player.alpha is not None]
+        if not masks:
+            return
+        union = np.zeros_like(masks[0], dtype=np.uint8)
+        for alpha in masks:
+            union |= (alpha >= 0.5).astype(np.uint8)
+        x, y, box_width, box_height = cv2.boundingRect(union)
+        if box_width == 0 or box_height == 0:
+            return
+        radius = int(math.ceil(JECATATU_SPLIT_DISTANCE * height * ROLE_ALPHA_SCALE / 2.0)) + 1
+        # Fecha so na regiao do grupo (com margem do raio): bem mais barato que o quadro.
+        rx0, ry0 = max(0, x - radius), max(0, y - radius)
+        rx1 = min(union.shape[1], x + box_width + radius)
+        ry1 = min(union.shape[0], y + box_height + radius)
+        # Retangular: separavel, ~10x mais rapido que a elipse; o poligono apaga a diferenca.
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * radius + 1, 2 * radius + 1))
+        fused = np.zeros_like(union, dtype=np.float32)
+        fused[ry0:ry1, rx0:rx1] = cv2.morphologyEx(
+            union[ry0:ry1, rx0:rx1], cv2.MORPH_CLOSE, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0
+        )
+        key = frozenset(player.slot for player in group)
+        shape = self._group_shapes.get(key)
+        if shape is None:
+            shape = self._group_shapes[key] = SilhouetteShape()
+        shape.alpha = fused
+        region = self._silhouette_region(shape, width, height)
+        if region is None:
+            return
+        x0, y0, x1, y1, cover = region
+        painting = self._slide(self._group_paintings[key], width, height)[y0:y1, x0:x1]
+        if cover.dtype == bool:
+            cv2.copyTo(painting, cover.view(np.uint8), body[y0:y1, x0:x1])
+        else:
+            body[y0:y1, x0:x1] = cv2.blendLinear(body[y0:y1, x0:x1], painting, 1.0 - cover, cover)
+
+    def _process_jeca(
+        self, frame_bgr: np.ndarray, body_mask: Optional[np.ndarray] = None
+    ) -> VisionResult:
+        """Jeca: pinturas em sequencia ao fundo e, por cima, as silhuetas recortadas
+        em xadrez, um de cada paleta, com os vaos transparentes."""
+        height, width = frame_bgr.shape[:2]
+        boxes, masks = self._segmenter.people(frame_bgr)
+        self._people_source = "YOLO-seg"
+        self._people_history.append(min(len(boxes), CAIPIRA_MAX_PEOPLE))
+        self.people_count = sorted(self._people_history)[len(self._people_history) // 2]
+        self._people_yolo_boxes = boxes
+        # Sem arpejos: so o rastreio (sem fluxo optico, que aqui nao seria usado).
+        scale = np.ones(2, dtype=np.float32)
+        now = self._track_players(
+            boxes, None, scale, (width, height), list(range(1, CAIPIRA_MAX_PEOPLE + 1)), False
+        )
+        self._update_silhouette_masks(boxes, masks, now, width, height)
+        state = self._slide_state(now)
+        self._prefetch_slide(state[1], width, height, False)
+        body = self._compose_slides(state, width, height)
+        for player in self._viola_players:
+            self._paste_silhouette(body, player)
+        debug = frame_bgr.copy()
+        self._draw_people_debug(debug)
+        return VisionResult(None, debug, body)
+
+    @staticmethod
+    def _raster_polygons(polygons: list[np.ndarray], shape: tuple[int, int]) -> np.ndarray:
+        """Poligonos preenchidos (255) numa mascara do tamanho dado."""
+        area = np.zeros(shape, dtype=np.uint8)
+        cv2.fillPoly(area, [np.round(polygon).astype(np.int32) for polygon in polygons], 255)
+        return area
+
+    def _process_viola(
+        self, frame_bgr: np.ndarray, gray: np.ndarray, body_mask: Optional[np.ndarray] = None
+    ) -> VisionResult:
+        """Viola: pinturas em sequencia; cada pessoa liga um arpejo, mais alto se mexe."""
+        height, width = frame_bgr.shape[:2]
+        flow = None if self._previous_gray is None else self._farneback(gray)
+        scale = np.array((gray.shape[1] / width, gray.shape[0] / height), dtype=np.float32)
+        small = self._silhouette_mask(frame_bgr, body_mask)
+        self._people_source = "MOG2" if body_mask is None else "Kinect"
+        self._count_people(small)
+        if self._yolo is not None:
+            self._count_people_yolo(frame_bgr)
+        boxes = self._people_yolo_boxes if self._yolo is not None else self._people_boxes
+        self._mix_arpeggios(boxes, flow, scale, (width, height))
+        state = self._slide_state(self._viola_now)
+        self._prefetch_slide(state[1], width, height, self.viola_blend == "cores")
+        if self.viola_blend == "nenhuma":
+            body = self._compose_slides(state, width, height)
+        else:
+            body = self._blend_plaid(state, flow, scale, width, height)
+        debug = frame_bgr.copy()
+        self._draw_people_debug(debug)
+        return VisionResult(None, debug, body)
+
+    def _draw_people_debug(self, debug: np.ndarray) -> None:
+        """Caixas e contagens da mascara e do YOLO, para comparar os dois."""
+        # Cada pessoa: o seu canal e o volume, com a excitacao das cordas (caipira)
+        # ou o movimento (viola, roda); no caipira a caixa engrossa enquanto ela
+        # excita as cordas. Texto proporcional a largura do quadro.
+        font_scale = 0.8 * min(1.0, debug.shape[1] / 1280.0) + 0.2
+        for player in self._viola_players:
+            x0, y0, x1, y1 = player.box
+            volume = self.channel_volumes.get(player.slot, 0.0)
+            if self.mode == "caipira":
+                if player.excitation >= CAIPIRA_EXCITE_MIN:
+                    cv2.rectangle(
+                        debug, (x0 - 8, y0 - 8), (x1 + 8, y1 + 8), CAIPIRA_PLAYER_COLOR, 6
+                    )
+                text = f"canal{player.slot} vol {volume:.0%} cordas {player.excitation:.0%}"
+            elif self.mode in ("viola", ROLE_MODE):
+                text = f"canal{player.slot} vol {volume:.0%} mov {player.motion:.1f}"
+            else:
+                text = f"pessoa{player.slot}"
+            for thickness, ink in ((5, (0, 0, 0)), (2, CAIPIRA_PLAYER_COLOR)):
+                cv2.putText(
+                    debug, text, (x0, max(25, y0 - 14)), cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                    ink, thickness, cv2.LINE_AA,
+                )
+        for x0, y0, x1, y1 in self._people_boxes:
+            cv2.rectangle(debug, (x0, y0), (x1, y1), CAIPIRA_MASK_COLOR, 2)
+        # Um pouco maiores, para nao sumirem sob as da mascara.
+        for x0, y0, x1, y1 in self._people_yolo_boxes:
+            cv2.rectangle(debug, (x0 - 4, y0 - 4), (x1 + 4, y1 + 4), CAIPIRA_YOLO_COLOR, 2)
+        lines = [(f"{self._people_source}: {self.people_count}", CAIPIRA_MASK_COLOR)]
+        if self.people_count_yolo is not None:
+            lines.append((f"YOLO: {self.people_count_yolo}", CAIPIRA_YOLO_COLOR))
+        y = debug.shape[0] - 20 - 45 * (len(lines) - 1)
+        for text, color in lines:
+            for thickness, ink in ((6, (0, 0, 0)), (2, color)):
+                cv2.putText(
+                    debug, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 1.3, ink, thickness,
+                    cv2.LINE_AA,
+                )
+            y += 45
+
     def _silhouette_fill(
-        self, frame_bgr: np.ndarray, body_mask: Optional[np.ndarray]
+        self,
+        frame_bgr: np.ndarray,
+        body_mask: Optional[np.ndarray],
+        small: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Quadro preto com os corpos preenchidos pela cor base do xadrez."""
         height, width = frame_bgr.shape[:2]
-        small = self._silhouette_mask(frame_bgr, body_mask)
+        if small is None:
+            small = self._silhouette_mask(frame_bgr, body_mask)
         blue, green, red = plaid_palette(self.plaid_hue)[0]
         if not self.render.soft_silhouette:
             # Borda dura: amplia so a mascara (1 canal) e recorta um quadro de cor
@@ -2482,6 +4464,18 @@ class VisionProcessor:
                 image, width, height, self._crop_anchor(image)
             )
         return self._window_cache[key]
+
+    def _caipira_background(self, width: int, height: int) -> np.ndarray:
+        """Pintura atual ajustada ao quadro e escurecida; refeita so ao trocar."""
+        key = (self.landscape_index, width, height)
+        if self._background_key != key:
+            image = self._landscape_images[self.landscape_index][1]
+            fitted = fit_cover(image, width, height, self._crop_anchor(image))
+            self._background = cv2.convertScaleAbs(
+                fitted, alpha=CAIPIRA_BACKGROUND_BRIGHTNESS
+            )
+            self._background_key = key
+        return self._background
 
     def _crop_anchor(self, image: np.ndarray) -> float:
         """Altura do recorte: sorteada para imagens em retrato, --image-anchor nas outras."""
@@ -2520,15 +4514,16 @@ class VisionProcessor:
         if self._field is None or self._field.size != (width, height):
             self._field = self._make_field(width, height)
             self._previous_gray = None
-        elif self.mode == "xadrez" and self._field.layout != (
+        elif self.mode in PLAID_MODES and self._field.layout != (
             self.plaid_layout,
             self.plaid_density,
             self.plaid_rotation,
         ):
             self._field = self._make_field(width, height)
-        if self.mode == "xadrez":
+        if self.mode in PLAID_MODES:
             self._field.gain = self.plaid_gain
             self._field.hue = self.plaid_hue
+            self._field.disorder_pulses = self.mode == "caipira"
         elif self.mode == "mato":
             self._field.gain = self.meadow_gain
         elif self.mode == "paisagens":
@@ -2546,21 +4541,38 @@ class VisionProcessor:
             (gray.shape[1] / width, gray.shape[0] / height), dtype=np.float32
         )
         self._field.update(flow, scale, self.FLOW_THRESHOLD)
-        if self.mode in ("xadrez", "paisagens"):
+        if self.mode in (*PLAID_MODES, "paisagens"):
             now = self.clock()
             # Limita o passo: uma pausa longa nao deve teletransportar os pulsos nem
             # adiantar a regeneracao.
             dt = 0.0 if self._field_clock is None else min(now - self._field_clock, 0.1)
             self._field_clock = now
-            if self.mode == "xadrez":
+            if self.mode in PLAID_MODES:
                 self._field.advance(dt)
+                self.line_disorder = self._field.disorder
             else:
                 self._field.regen_delay = self.landscape_regen_delay
                 self._field.regen_time = self.landscape_regen_time
                 self._field.regenerate(dt)
-        # A silhueta fica por baixo; linhas e pulsos sao desenhados por cima.
-        if self.mode == "xadrez" and self.silhouette:
-            body = self._silhouette_fill(frame_bgr, body_mask)
+        # O caipira conta as pessoas em todo quadro, com ou sem silhueta; a mesma
+        # mascara serve a silhueta, para o MOG2 aprender uma vez so por quadro.
+        small = None
+        if self.mode == "caipira":
+            small = self._silhouette_mask(frame_bgr, body_mask)
+            self._people_source = "MOG2" if body_mask is None else "Kinect"
+            self._count_people(small)
+            if self._yolo is not None:
+                self._count_people_yolo(frame_bgr)
+            boxes = self._people_yolo_boxes if self._yolo is not None else self._people_boxes
+            self._play_toada(boxes, flow, scale, (width, height), self._field)
+        # A silhueta fica por baixo; linhas e pulsos sao desenhados por cima. No
+        # caipira, a pintura fica por baixo de tudo.
+        if self.mode in PLAID_MODES and self.silhouette:
+            body = self._silhouette_fill(frame_bgr, body_mask, small)
+            if self.mode == "caipira":
+                body = cv2.max(self._caipira_background(width, height), body)
+        elif self.mode == "caipira":
+            body = self._caipira_background(width, height).copy()
         else:
             body = np.zeros_like(frame_bgr)
         self._field.draw(body)
@@ -2573,6 +4585,8 @@ class VisionProcessor:
         # Desenhar uma vez e compor com max custa ~0,2 ms; redesenhar as linhas
         # anti-aliased no quadro de debug custaria outros ~3 ms.
         debug = cv2.max(frame_bgr, body) if self.render.debug_output else body
+        if self.mode == "caipira" and self.render.debug_output:
+            self._draw_people_debug(debug)
         return VisionResult(None, debug, body)
 
     def _process_flow(self, frame_bgr: np.ndarray, gray: np.ndarray) -> VisionResult:
@@ -2741,7 +4755,10 @@ class VisionProcessor:
         curves = np.einsum("sk,ekd->esd", BEZIER_BASIS, anchors)
         return np.rint(curves).astype(np.int32)
 
-    def _process_yolo(self, frame_bgr: np.ndarray) -> VisionResult:
+    def _yolo_keypoints(
+        self, frame_bgr: np.ndarray
+    ) -> tuple[np.ndarray, Optional[np.ndarray]]:
+        """Keypoints (pessoas, 17, 2) no quadro original e confiancas (pessoas, 17)."""
         height, width = frame_bgr.shape[:2]
         input_height, input_width = YOLO_INPUT_SIZE
         frame_small = frame_bgr
@@ -2760,6 +4777,11 @@ class VisionProcessor:
         points = np.asarray(points, dtype=np.float32) * np.array(
             (width / input_width, height / input_height), dtype=np.float32
         )
+        return points, confidence
+
+    def _process_yolo(self, frame_bgr: np.ndarray) -> VisionResult:
+        height, width = frame_bgr.shape[:2]
+        points, confidence = self._yolo_keypoints(frame_bgr)
         raw_nodes = self._build_nodes(points, confidence, width, height)
         stable_nodes = self._presentation_deadband.apply(raw_nodes)
         self._mesh_connections = {
@@ -2828,6 +4850,297 @@ class VisionProcessor:
                     cv2.circle(image, point, radius + 3, (0, 55, 0), -1, cv2.LINE_AA)
                     cv2.circle(image, point, radius, (0, 255, 0), -1, cv2.LINE_AA)
         return VisionResult(None, debug, body)
+
+
+def mp3_gapless(data: bytes) -> Optional[tuple[int, int]]:
+    """(amostras a pular, amostras validas) do cabecalho Xing/Info + LAME, ou None."""
+    position = 0
+    if data[:3] == b"ID3":
+        position = 10 + sum((data[6 + index] & 0x7F) << (7 * (3 - index)) for index in range(4))
+    while position + 4 <= len(data) and not (
+        data[position] == 0xFF and data[position + 1] & 0xE0 == 0xE0
+    ):
+        position += 1
+    if position + 4 > len(data):
+        return None
+    # MPEG-1 tem 1152 amostras por quadro; MPEG-2/2.5, 576.
+    samples_per_frame = 1152 if (data[position + 1] >> 3) & 3 == 3 else 576
+    header = data[position : position + 200]
+    tag = max(header.find(b"Xing"), header.find(b"Info"))
+    if tag < 0:
+        return None
+    tag += position
+    flags = int.from_bytes(data[tag + 4 : tag + 8], "big")
+    if not flags & 1:
+        return None
+    frames = int.from_bytes(data[tag + 8 : tag + 12], "big")
+    offset = tag + 12 + 4 * bool(flags & 2) + 100 * bool(flags & 4) + 4 * bool(flags & 8)
+    lame = data[offset : offset + 24]
+    if len(lame) < 24 or not lame[:4].isalpha():
+        return None
+    delay = (lame[21] << 4) | (lame[22] >> 4)
+    padding = ((lame[22] & 0x0F) << 8) | lame[23]
+    return delay + MP3_DECODER_DELAY, frames * samples_per_frame - delay - padding
+
+
+def load_viola_channels(directory: str, sample_rate: int) -> dict[int, np.ndarray]:
+    """Arpejo de cada canal (1 a VIOLA_CHANNELS), mono, pelo "canalN" no nome."""
+    import miniaudio
+
+    channels: dict[int, np.ndarray] = {}
+    for name in sorted(os.listdir(directory)):
+        match = re.search(r"canal(\d+)", name.lower())
+        if match is None or not name.lower().endswith(VIOLA_EXTENSIONS):
+            continue
+        channel = int(match.group(1))
+        if not 1 <= channel <= VIOLA_CHANNELS:
+            continue
+        if channel in channels:
+            print(f"Aviso: canal{channel} repetido; ignorando {name}.", file=sys.stderr)
+            continue
+        with open(os.path.join(directory, name), "rb") as sound_file:
+            data = sound_file.read()
+        sound = miniaudio.decode(
+            data,
+            output_format=miniaudio.SampleFormat.FLOAT32,
+            nchannels=1,
+            sample_rate=sample_rate,
+        )
+        samples = np.asarray(sound.samples, dtype=np.float32)
+        gapless = mp3_gapless(data) if name.lower().endswith(".mp3") else None
+        if gapless is not None:
+            skip, length = gapless
+            # Converte da taxa do arquivo para a de saida.
+            ratio = sample_rate / sound_file_rate(data, sound)
+            # O miniaudio recente (dr_mp3) ja corta atraso e enchimento ao ler o
+            # cabecalho LAME e devolve so as amostras validas: cortar de novo comeria
+            # o inicio do loop.
+            if abs(len(samples) - length * ratio) > 2 + ratio:
+                samples = samples[round(skip * ratio) : round((skip + length) * ratio)]
+        elif name.lower().endswith(".mp3"):
+            print(
+                f"Aviso: {name} sem cabecalho LAME/Info; o loop pode ter um pequeno "
+                "silencio. Exporte com o cabecalho (padrao do Audacity/ffmpeg) ou use WAV.",
+                file=sys.stderr,
+            )
+        peak = float(np.abs(samples).max(initial=0.0))
+        if peak > 0:
+            samples *= VIOLA_CHANNEL_PEAK / peak
+        channels[channel] = samples
+    lengths = {round(len(loop) / sample_rate, 2) for loop in channels.values()}
+    if len(lengths) > 1:
+        print(
+            f"Aviso: arpejos com duracoes diferentes ({', '.join(f'{v:g}s' for v in sorted(lengths))}); "
+            "cada um repete no seu tempo e eles saem de sincronia.",
+            file=sys.stderr,
+        )
+    return channels
+
+
+def sound_file_rate(data: bytes, sound) -> int:
+    """Taxa original do arquivo (o decode ja devolve convertida)."""
+    import miniaudio
+
+    try:
+        return miniaudio.mp3_get_info(data).sample_rate
+    except Exception:
+        return sound.sample_rate
+
+
+class ViolaArpeggios:
+    """Arpejos em loop, sincronizados; cada canal tem um volume com rampa.
+
+    set_volume() pode ser chamado de qualquer thread; vale no proximo bloco.
+    """
+
+    def __init__(
+        self, directory: str = VIOLA_ARPEGGIO_DIR, sample_rate: int = VIOLA_SAMPLE_RATE
+    ) -> None:
+        self.sample_rate = sample_rate
+        self.channels = load_viola_channels(directory, sample_rate)
+        if not self.channels:
+            raise RuntimeError(
+                f"nenhum arquivo com canal1 a canal{VIOLA_CHANNELS} no nome em {directory}"
+            )
+        self.error: Optional[str] = None
+        self._targets = dict.fromkeys(self.channels, 0.0)
+        self.volumes = dict.fromkeys(self.channels, 0.0)
+        # Relogio unico: todos os canais leem a mesma posicao, mesmo mudos, mais o
+        # deslocamento (amostras) de cada um: 0 no modo viola (sincronizados).
+        self._position = 0
+        self._offsets = dict.fromkeys(self.channels, 0)
+        # Tempo proprio de cada canal (jecatatu): um deslocamento sorteado no loop.
+        rng = np.random.default_rng()
+        self.own_offsets = {
+            channel: int(rng.integers(len(loop))) for channel, loop in self.channels.items()
+        }
+        # Troca de tempo em andamento: canal -> (deslocamento novo, progresso 0 a 1).
+        self._fades: dict[int, tuple[int, float]] = {}
+        self._lock = threading.Lock()
+        self._stream = None
+        try:
+            import sounddevice
+
+            self._stream = sounddevice.OutputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype="float32",
+                callback=self._callback,
+                latency=VIOLA_LATENCY,
+            )
+            self._stream.start()
+        except Exception as exc:
+            self._stream = None
+            self.error = f"{type(exc).__name__}: {exc}"
+            print(
+                f"Aviso: arpejos sem audio ({self.error}); os canais aparecem no debug, "
+                "mas nao tocam.",
+                file=sys.stderr,
+            )
+
+    def set_volume(self, channel: int, volume: float) -> None:
+        if channel in self._targets:
+            self._targets[channel] = volume
+
+    def follow(self, channel: int, leader: int) -> None:
+        """Poe o canal no tempo proprio de leader (ele mesmo: volta ao seu), com
+        crossfade de VIOLA_SYNC_FADE s; o mesmo tempo de antes nao faz nada."""
+        if channel not in self._offsets or leader not in self.own_offsets:
+            return
+        target = self.own_offsets[leader]
+        with self._lock:
+            fade = self._fades.get(channel)
+            heading = fade[0] if fade is not None else self._offsets[channel]
+            if heading == target:
+                return
+            if self.volumes[channel] == 0.0 and self._targets[channel] == 0.0:
+                # Mudo (a pessoa acabou de chegar): vai direto, nao ha o que ouvir.
+                self._offsets[channel] = target
+                self._fades.pop(channel, None)
+                return
+            if fade is not None:
+                # Troca no meio de outra: parte do tempo para onde ja ia.
+                self._offsets[channel] = fade[0]
+            self._fades[channel] = (target, 0.0)
+
+    def leader_of(self, channel: int) -> int:
+        """Canal cujo tempo proprio o canal segue (ou para onde esta indo)."""
+        fade = self._fades.get(channel)
+        offset = fade[0] if fade is not None else self._offsets.get(channel)
+        for leader, own in self.own_offsets.items():
+            if own == offset:
+                return leader
+        return channel
+
+    def render(self, frames: int) -> np.ndarray:
+        """Proximas frames amostras da mistura (mono, float32)."""
+        out = np.zeros(frames, dtype=np.float32)
+        indices = np.arange(self._position, self._position + frames)
+        rise = VIOLA_VOLUME_RISE * frames / self.sample_rate
+        fall = VIOLA_VOLUME_FALL * frames / self.sample_rate
+        step = frames / (VIOLA_SYNC_FADE * self.sample_rate)
+        with self._lock:
+            for channel, loop in self.channels.items():
+                current = self.volumes[channel]
+                target = self._targets[channel]
+                following = current + min(rise, max(-fall, target - current))
+                self.volumes[channel] = following
+                fade = self._fades.get(channel)
+                if current == 0.0 and following == 0.0:
+                    # Mudo: a troca de tempo termina na hora (nada para ouvir).
+                    if fade is not None:
+                        self._offsets[channel] = fade[0]
+                        del self._fades[channel]
+                    continue
+                ramp = np.linspace(current, following, frames, endpoint=False, dtype=np.float32)
+                sound = loop[(indices + self._offsets[channel]) % len(loop)]
+                if fade is not None:
+                    # Duas cabecas de leitura no mesmo loop: a antiga sai, a nova entra.
+                    target_offset, progress = fade
+                    mix = np.linspace(
+                        progress, min(1.0, progress + step), frames, endpoint=False,
+                        dtype=np.float32,
+                    )
+                    sound = sound * (1.0 - mix) + loop[(indices + target_offset) % len(loop)] * mix
+                    if progress + step >= 1.0:
+                        self._offsets[channel] = target_offset
+                        del self._fades[channel]
+                    else:
+                        self._fades[channel] = (target_offset, progress + step)
+                out += ramp * sound
+        self._position += frames
+        return np.tanh(out, out=out)
+
+    def _callback(self, outdata, frames, time_info, status) -> None:
+        outdata[:, 0] = self.render(frames)
+
+    def close(self) -> None:
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+
+def make_viola_arpeggios(mode: str, toada: bool = True) -> Optional[ViolaArpeggios]:
+    """Canais em loop do modo: a toada do caipira (toada=False a desliga) ou os
+    arpejos da viola, roda e jecatatu; None em outro modo ou sem sons."""
+    if mode == "caipira":
+        if not toada:
+            return None
+        directory, label = CAIPIRA_CHANNEL_DIR, "toada"
+    elif mode in ("viola", ROLE_MODE, JECATATU_MODE):
+        directory, label = VIOLA_ARPEGGIO_DIR, "arpejos"
+    else:
+        return None
+    try:
+        return ViolaArpeggios(directory)
+    except Exception as exc:
+        print(f"Aviso: {label} desativados: {exc}", file=sys.stderr)
+        return None
+
+
+class SilhouetteShape:
+    """Forma de silhueta sem pessoa propria (a fusao de um grupo): mascara e poligono
+    estabilizado, como os de ViolaPlayer."""
+
+    def __init__(self) -> None:
+        self.alpha: Optional[np.ndarray] = None
+        self.polygons: Optional[list[np.ndarray]] = None
+        self.polygon_center = np.zeros(2, dtype=np.float32)
+
+
+class ViolaPlayer:
+    """Pessoa rastreada no caipira, na viola ou na roda, com o canal que ela toca."""
+
+    def __init__(self, box: tuple[int, int, int, int], slot: int, now: float) -> None:
+        # Canal da toada (caipira) ou de arpejo (viola, roda).
+        self.slot = slot
+        self.seen = now
+        self.motion = 0.0
+        # Caipira: excitacao das cordas na caixa (0 a 1) no ultimo quadro.
+        self.excitation = 0.0
+        # Viola: movimento suavizado (0 a 1) que da o volume do canal.
+        self.level = 0.0
+        # Roda de viola: paisagem da pessoa e a sua mascara suavizada (meia resolucao).
+        self.painting: Optional[int] = None
+        self.alpha: Optional[np.ndarray] = None
+        # Roda de viola: poligonos atuais da silhueta (escala da mascara pequena).
+        self.polygons: Optional[list[np.ndarray]] = None
+        # Centro da mascara a que os poligonos atuais estao presos.
+        self.polygon_center = np.zeros(2, dtype=np.float32)
+        # Jecatatu: brilho da silhueta (1 no contato, decai ate 0).
+        self.glow = 0.0
+        # Jeca: tecido de xadrez da pessoa (cores, linhas, vetor de repeticao, margem,
+        # tamanho do quadro e angulo), centro em que ele nasceu e deslocamento atual.
+        self.plaid: Optional[tuple] = None
+        self.plaid_origin = np.zeros(2, dtype=np.float32)
+        self.plaid_offset = np.zeros(2, dtype=np.float32)
+        self.place(box, now)
+
+    def place(self, box: tuple[int, int, int, int], now: float) -> None:
+        self.box = box
+        self.center = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+        self.seen = now
 
 
 def metronome_click(frequency: float, amplitude: float, sample_rate: int) -> np.ndarray:
@@ -3150,13 +5463,21 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("kinect", "mog2", "optical_flow", "conexoes", "capim", "mato", "paisagens", "xadrez"),
+        choices=(
+            "kinect", "mog2", "optical_flow", "conexoes", "capim", "mato", "paisagens",
+            *PLAID_MODES, "viola", ROLE_MODE, JECA_MODE, JECATATU_MODE,
+        ),
         default=None,
         help="algoritmo 2D: kinect, mog2, optical_flow, conexoes (malha YOLO), capim "
         "(capim movido pelo optical flow), mato (tracos em camadas, o do meio movido pelo "
-        "optical flow), paisagens (imagem borrada pelo optical flow) ou xadrez (xadrez "
-        "Madras movido pelo optical flow) (padrao: kinect "
-        "para Kinect, mog2 para outras fontes)",
+        "optical flow), paisagens (imagem borrada pelo optical flow), xadrez (xadrez "
+        "Madras movido pelo optical flow), caipira (xadrez com pinturas e viola), viola "
+        "(pinturas em sequencia e arpejos ligados pelas pessoas), roda-de-viola "
+        "(silhuetas recortadas em paisagens sobre branco, com arpejos), jeca "
+        "(pinturas em sequencia com as silhuetas em xadrez transparente) ou jecatatu "
+        "(silhuetas em paisagens sobre preto, xadrez reagindo a cabeca, maos e pes, "
+        "arpejos que sincronizam quando as silhuetas se fundem) "
+        f"(padrao: {DEFAULT_MODE})",
     )
     parser.add_argument(
         "--nogpu",
@@ -3237,9 +5558,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--rotation",
         type=float,
-        default=DEFAULT_PLAID_ROTATION,
+        default=None,
         help="xadrez: rotacao do padrao em graus, em torno do centro do quadro "
-        "(padrao: %(default)s; teclas d/c)",
+        f"(padrao: {DEFAULT_PLAID_ROTATION:g}; {CAIPIRA_ROTATION:g} no caipira; teclas d/c)",
     )
     parser.add_argument(
         "--hue",
@@ -3247,7 +5568,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help="xadrez: matiz base das linhas em graus (0 vermelho, 120 verde, 240 azul); "
         "as faixas variam so em luminosidade, da cor pura ao branco "
-        "(padrao: sorteado; teclas f/v giram o disco de cores)",
+        f"(padrao: sorteado; {CAIPIRA_HUE:g}, laranja, no caipira; teclas f/v giram o "
+        "disco de cores)",
     )
     parser.add_argument(
         "--pulses",
@@ -3267,16 +5589,28 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--layout",
         choices=tuple(PLAID_LAYOUTS),
-        default="mix",
+        default=None,
         help="xadrez: mix (malhas independentes em alturas diferentes, com densidades, "
         f"angulos e paralaxe proprios; densidade ate {PLAID_MIX_MAX_DENSITY}) ou regular "
-        "(uma malha) (padrao: mix; tecla l alterna)",
+        "(uma malha) (padrao: mix; regular no modo viola, onde o mix dobra o custo; "
+        "tecla l alterna)",
+    )
+    parser.add_argument(
+        "--blend",
+        choices=VIOLA_BLENDS,
+        default=VIOLA_BLENDS[0],
+        help="viola: mescla do xadrez com as pinturas; tecido (a pintura se deforma "
+        "com as linhas), quadros (cada quadrado segue com atraso proprio e troca de "
+        "pintura no seu momento), cores (linhas com as cores da pintura), janela (a "
+        "pintura so aparece pelas linhas), recorte (as linhas recortam a pintura e so "
+        "aparecem quando se movem) ou nenhuma "
+        "(padrao: %(default)s; tecla e alterna)",
     )
     parser.add_argument(
         "--pi",
         action="store_true",
-        help="perfil Raspberry Pi 4: modo xadrez (padrao) ou paisagens; so a janela do "
-        "projetor (FPS no terminal); no xadrez, sem anti-aliasing, curvas e silhueta "
+        help="perfil Raspberry Pi 4: modo caipira (padrao), xadrez ou paisagens; so a janela do "
+        "projetor (FPS no terminal); no xadrez e no caipira, sem anti-aliasing, curvas e silhueta "
         "simplificadas e no maximo 40 pulsos",
     )
     parser.add_argument(
@@ -3290,7 +5624,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=LANDSCAPE_DEFAULT_IMAGE,
         metavar="ARQUIVO_OU_PASTA",
         help="paisagens: imagem ou pasta de imagens que cobrem a tela; com uma pasta, "
-        "a/z alternam entre elas em ordem alfabetica (padrao: a pasta paisagens/)",
+        "a/z alternam entre elas em ordem alfabetica; caipira: fundo das linhas, uma "
+        "sorteada na partida, tecla i passa a proxima (padrao: a pasta paisagens/)",
     )
     parser.add_argument(
         "--image-anchor",
@@ -3336,6 +5671,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "modos; tecla t liga/desliga)",
     )
     parser.add_argument(
+        "--viola",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="caipira: cada pessoa detectada (ate 5) recebe um canal sorteado da toada, "
+        "que sobe de volume enquanto ela excita as cordas e decai sem interacao; sons "
+        "em sons/toada-caipira (padrao: ligado)",
+    )
+    parser.add_argument(
         "--bpm",
         type=float,
         default=METRONOME_DEFAULT_BPM,
@@ -3365,10 +5708,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         )
     if args.pi:
         if args.mode not in (None, *PI_MODES):
-            parser.error(f"--pi so suporta --mode {' ou '.join(PI_MODES)}")
-        args.mode = args.mode or PI_MODES[0]
+            parser.error(
+                f"--pi so suporta --mode {', '.join(PI_MODES[:-1])} ou {PI_MODES[-1]}"
+            )
     if args.mode is None:
-        args.mode = "kinect" if args.source == "kinect" else "mog2"
+        args.mode = DEFAULT_MODE
+    if args.layout is None:
+        args.layout = "regular" if args.mode in ("viola", JECATATU_MODE) else "mix"
     if args.mode == "kinect" and args.source != "kinect":
         parser.error("--mode kinect requer --source kinect")
     if args.max_distance <= 0:
@@ -3421,12 +5767,15 @@ def make_vision_processor(
     landscape_palette: str = "original",
     plaid_density: float = DEFAULT_PLAID_DENSITY,
     plaid_gain: float = DEFAULT_PLAID_GAIN,
-    plaid_rotation: float = DEFAULT_PLAID_ROTATION,
+    plaid_rotation: Optional[float] = None,
     plaid_hue: Optional[float] = None,
     pulse_rate: float = DEFAULT_PULSE_RATE,
     silhouette: bool = False,
     plaid_layout: str = "mix",
     render: PlaidRender = PlaidRender(),
+    people_yolo: bool = False,
+    arpeggios: Optional[ViolaArpeggios] = None,
+    viola_blend: str = VIOLA_BLENDS[0],
 ) -> Optional[VisionProcessor]:
     return (
         None
@@ -3459,6 +5808,9 @@ def make_vision_processor(
             silhouette=silhouette,
             plaid_layout=plaid_layout,
             render=render,
+            people_yolo=people_yolo,
+            arpeggios=arpeggios,
+            viola_blend=viola_blend,
         )
     )
 
@@ -3469,6 +5821,15 @@ MODE_KEY_HELP = {
     "kinect": "a/z profundidade minima | s/x maxima | b calibra o fundo (sala vazia)",
     "xadrez": "a/z densidade | s/x ganho | d/c rotacao | f/v matiz | g silhueta | "
     "l malha mix/regular | b fundo (Kinect)",
+    "caipira": "a/z densidade | s/x ganho | d/c rotacao | f/v matiz | g silhueta | "
+    "l malha mix/regular | i proxima pintura | b fundo (Kinect)",
+    ROLE_MODE: "e borda poligono/serrilhado/suave",
+    JECA_MODE: "i proxima pintura | e borda poligono/serrilhado/suave",
+    JECATATU_MODE: "e borda poligono/serrilhado/suave | a/z densidade | s/x ganho | "
+    "d/c rotacao | f/v matiz | l malha mix/regular",
+    "viola": "i proxima pintura | e mescla tecido/quadros/cores/janela/recorte/nenhuma | "
+    "a/z densidade | "
+    "s/x ganho | d/c rotacao | f/v matiz | l malha mix/regular | b fundo (Kinect)",
     "paisagens": "a/z pintura | p paleta | s/x forca | h/n feixe | d/c espera da volta | "
     "f/v tempo da volta | g silhueta | b fundo (Kinect)",
 }
@@ -3509,6 +5870,7 @@ def main() -> int:
     active_mode = resolve_active_mode(args.mode, capturer)
     render = PI_PLAID_RENDER if args.pi else PlaidRender()
     metronome = Metronome(args.bpm, args.metronome)
+    arpeggios = make_viola_arpeggios(active_mode, args.viola)
     try:
         processor = make_vision_processor(
             active_mode,
@@ -3538,9 +5900,14 @@ def main() -> int:
             silhouette=args.silhouette,
             plaid_layout=args.layout,
             render=render,
+            people_yolo=not args.pi,
+            arpeggios=arpeggios,
+            viola_blend=args.blend,
         )
     except Exception as exc:
         capturer.close()
+        if arpeggios is not None:
+            arpeggios.close()
         print(f"Erro ao iniciar modo {active_mode}: {exc}", file=sys.stderr)
         return 1
     video_choice = args.source if args.source not in {"kinect", "webcam"} else args.fallback_video
@@ -3718,6 +6085,9 @@ def main() -> int:
                             silhouette=args.silhouette,
                             plaid_layout=args.layout,
                             render=render,
+                            people_yolo=not args.pi,
+                            arpeggios=arpeggios,
+                            viola_blend=args.blend,
                         )
                     elif processor is not None:
                         processor.reset()
@@ -3739,8 +6109,11 @@ def main() -> int:
                     capturer.adjust_depth(max_delta=DEPTH_STEP_MM)
                 elif key == ord("b"):
                     calibrate_kinect_background(capturer)
-            elif active_mode == "xadrez":
-                if key in PLAID_KEY_ADJUSTMENTS:
+            elif active_mode in PLAID_MODES:
+                if active_mode == "caipira" and key == CAIPIRA_IMAGE_KEY:
+                    processor.switch_landscape(1)
+                    print(processor.label)
+                elif key in PLAID_KEY_ADJUSTMENTS:
                     processor.adjust_plaid(**PLAID_KEY_ADJUSTMENTS[key])
                     print(processor.label)
                 elif key == SILHOUETTE_TOGGLE_KEY:
@@ -3752,6 +6125,25 @@ def main() -> int:
                 elif key == ord("b") and isinstance(capturer, KinectV1Capturer):
                     # A silhueta usa a mascara de profundidade, que melhora com o fundo.
                     calibrate_kinect_background(capturer)
+            elif active_mode in ("viola", JECA_MODE) and key == CAIPIRA_IMAGE_KEY:
+                processor.skip_slide()
+                print(processor.label)
+            elif active_mode in (ROLE_MODE, JECA_MODE, JECATATU_MODE) and key == ROLE_EDGE_KEY:
+                processor.cycle_role_edge()
+                print(processor.label)
+            elif active_mode == "viola" and key == VIOLA_BLEND_KEY:
+                processor.cycle_blend()
+                print(processor.label)
+            elif active_mode in ("viola", JECATATU_MODE) and key in PLAID_KEY_ADJUSTMENTS:
+                processor.adjust_plaid(**PLAID_KEY_ADJUSTMENTS[key])
+                print(processor.label)
+            elif active_mode in ("viola", JECATATU_MODE) and key == LAYOUT_TOGGLE_KEY:
+                processor.toggle_layout()
+                print(processor.label)
+            elif active_mode == "viola" and key == ord("b") and isinstance(
+                capturer, KinectV1Capturer
+            ):
+                calibrate_kinect_background(capturer)
             elif active_mode == "paisagens" and key in LANDSCAPE_KEY_ADJUSTMENTS:
                 processor.adjust_landscape(LANDSCAPE_KEY_ADJUSTMENTS[key])
                 print(processor.label)
@@ -3778,6 +6170,8 @@ def main() -> int:
         print("\nInterrompido pelo usuario; encerrando captura...", file=sys.stderr)
     finally:
         metronome.close()
+        if arpeggios is not None:
+            arpeggios.close()
         if worker is not None:
             worker.close()
         if capturer is not None:
