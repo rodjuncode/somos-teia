@@ -35,13 +35,16 @@ from __future__ import annotations
 import argparse
 import colorsys
 import functools
+import itertools
 import math
 import os
 import re
 import sys
+import textwrap
 import threading
 import time
 from collections import deque
+import dataclasses
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
@@ -202,6 +205,43 @@ CAIPIRA_VOLUME_FLOOR = 0.02
 CAIPIRA_TRACK_MAX_JUMP = 0.2
 CAIPIRA_TRACK_GRACE = 1.0
 CAIPIRA_PLAYER_COLOR = (0, 255, 255)  # BGR: amarelo
+# Tela da obra (caipira): duas colunas na janela do projetor. A esquerda, um
+# terminal que registra tudo o que o programa faz (SYSTEM_LOG, mais tudo o que ele
+# imprime); a direita, a obra, com as caixas dos corpos no matiz das linhas. A obra
+# fica na resolucao do quadro e o terminal ocupa OBRA_LOG_FRACTION da largura total.
+# Sem janela de debug: as caixas, a interacao e o volume ficam na propria obra.
+OBRA_LOG_FRACTION = 0.2
+OBRA_LOG_CAPACITY = 600
+# Fonte monoespacada (a primeira encontrada); sem nenhuma, a Hershey do OpenCV.
+OBRA_FONTS = (
+    "consola.ttf",
+    "DejaVuSansMono.ttf",
+    "LiberationMono-Regular.ttf",
+    "UbuntuMono-R.ttf",
+    "cour.ttf",
+)
+OBRA_FONT_DIRS = (
+    os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts"),
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/liberation",
+    "/usr/share/fonts/truetype/ubuntu",
+    "/usr/share/fonts/TTF",
+    "/System/Library/Fonts",
+)
+# Linhas de texto que cabem na altura do terminal (define o corpo da fonte).
+OBRA_LOG_ROWS = 52
+# O terminal e redesenhado no maximo OBRA_LOG_FPS vezes por segundo; as caixas, a
+# cada quadro. Telemetria (FPS, visao) entra no log a cada OBRA_TELEMETRY_INTERVAL s.
+OBRA_LOG_FPS = 12.0
+OBRA_TELEMETRY_INTERVAL = 1.0
+# Cores do terminal e das caixas, em HSV (matiz das linhas): texto vivo, texto
+# apagado e fundo. As linhas mais antigas do log esmaecem ate OBRA_LOG_FADE.
+OBRA_BRIGHT_SV = (0.75, 1.0)
+OBRA_DIM_SV = (0.65, 0.55)
+OBRA_BACKGROUND_SV = (0.8, 0.07)
+OBRA_LOG_FADE = 0.35
+# Marcos do volume de cada canal registrados no log, subindo.
+OBRA_VOLUME_MARKS = (0.25, 0.5, 0.75, 1.0)
 # Viola e jeca: a tecla i adianta a proxima pintura da sequencia.
 PAINTING_KEY = ord("i")
 # Modo viola: pinturas de --image em sequencia embaralhada, cada uma por
@@ -1123,6 +1163,60 @@ def create_capturer(
     if os.path.splitext(source)[1].lower() not in {".mp4", ".mov", ".m4v"}:
         raise ValueError("--source deve ser 'kinect', 'webcam' ou um arquivo MP4/MOV")
     return VideoCapturer(source)
+
+
+class SystemLog:
+    """Registro do que o programa faz, mostrado no terminal da obra.
+
+    log() pode ser chamado de qualquer thread; guarda as OBRA_LOG_CAPACITY
+    entradas mais recentes (instante desde a partida, assunto, texto).
+    """
+
+    def __init__(self, capacity: int = OBRA_LOG_CAPACITY) -> None:
+        self._start = time.perf_counter()
+        self._lock = threading.Lock()
+        self._entries: deque[tuple[float, str, str]] = deque(maxlen=capacity)
+        # Total de entradas ja registradas: o terminal so redesenha quando muda.
+        self.count = 0
+
+    def log(self, topic: str, text: str) -> None:
+        with self._lock:
+            self._entries.append((time.perf_counter() - self._start, topic, text))
+            self.count += 1
+
+    def tail(self, count: int) -> list[tuple[float, str, str]]:
+        with self._lock:
+            return list(self._entries)[-count:]
+
+    def elapsed(self) -> float:
+        return time.perf_counter() - self._start
+
+
+SYSTEM_LOG = SystemLog()
+
+
+class LogTee:
+    """Repassa um stream (stdout/stderr) e copia cada linha para o SYSTEM_LOG."""
+
+    def __init__(self, stream, topic: str) -> None:
+        self._stream = stream
+        self._topic = topic
+        self._pending = ""
+
+    def write(self, text: str) -> int:
+        self._stream.write(text)
+        self._pending += text.replace("\r", "\n")
+        *lines, self._pending = self._pending.split("\n")
+        for line in lines:
+            if line.strip():
+                SYSTEM_LOG.log(self._topic, line.strip())
+        return len(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 @dataclass(slots=True)
@@ -2798,6 +2892,9 @@ class VisionProcessor:
         self.people_count_yolo: Optional[int] = None
         self._people_yolo_history: deque[int] = deque(maxlen=CAIPIRA_PEOPLE_WINDOW)
         self._people_yolo_boxes: list[tuple[int, int, int, int]] = []
+        # Confianca de cada caixa do YOLO e o tempo da ultima inferencia (ms).
+        self._people_yolo_scores: dict[tuple[int, int, int, int], Optional[float]] = {}
+        self._yolo_ms = 0.0
         # Pessoas rastreadas, cada uma com o seu canal (caipira, viola e roda).
         self._viola_players: list[ViolaPlayer] = []
         # Canais em loop: a toada no caipira, os arpejos na viola, roda e jecatatu.
@@ -2809,6 +2906,17 @@ class VisionProcessor:
         self._toada_levels: dict[int, float] = {}
         self._toada_excited: dict[int, float] = {}
         self._toada_clock: Optional[float] = None
+        # Tela da obra: caixas (uma por pessoa) e estado dos canais do ultimo quadro,
+        # lidos pela thread principal; e o instante do ultimo resumo da visao no log.
+        self.toada_players: list[dict] = []
+        self.toada_channels: list[dict] = []
+        self._vision_report = -math.inf
+        # Canal excitado no ultimo quadro (para logar so as mudancas) e os nomes das
+        # faixas quando a toada esta sem som (--no-viola): dos arquivos.
+        self._toada_active: dict[int, bool] = {}
+        self._channel_names: dict[int, str] = (
+            viola_channel_names(CAIPIRA_CHANNEL_DIR) if mode == "caipira" else {}
+        )
         # Roda de viola: segmentacao por pessoa e fundo branco guardado.
         self._segmenter: Optional[PersonSegmenter] = None
         self._white: Optional[np.ndarray] = None
@@ -3460,19 +3568,29 @@ class VisionProcessor:
 
     def _count_people_yolo(self, frame_bgr: np.ndarray) -> None:
         """Conta as pessoas detectadas pelo YOLO, ate CAIPIRA_MAX_PEOPLE."""
+        start = time.perf_counter()
         points, confidence = self._yolo_keypoints(frame_bgr)
+        self._yolo_ms = (time.perf_counter() - start) * 1000.0
         self._people_yolo_history.append(min(len(points), CAIPIRA_MAX_PEOPLE))
         history = sorted(self._people_yolo_history)
         self.people_count_yolo = history[len(history) // 2]
-        # Caixa de cada pessoa: extremos dos keypoints confiaveis.
-        boxes = []
+        # Caixa de cada pessoa: extremos dos keypoints confiaveis; e a confianca
+        # media deles, mostrada na caixa da obra.
+        boxes, scores = [], {}
         for index, person in enumerate(points):
+            score = None
             if confidence is not None:
-                person = person[confidence[index] >= YOLO_MIN_KEYPOINT_CONFIDENCE]
+                reliable = confidence[index] >= YOLO_MIN_KEYPOINT_CONFIDENCE
+                person = person[reliable]
+                if reliable.any():
+                    score = float(confidence[index][reliable].mean())
             if len(person):
                 (x0, y0), (x1, y1) = person.min(axis=0), person.max(axis=0)
-                boxes.append((round(x0), round(y0), round(x1), round(y1)))
+                box = (round(x0), round(y0), round(x1), round(y1))
+                boxes.append(box)
+                scores[box] = score
         self._people_yolo_boxes = boxes
+        self._people_yolo_scores = scores
 
     def _track_players(
         self,
@@ -3518,13 +3636,41 @@ class VisionProcessor:
             players[player_index].place(boxes[box_index], now)
             matched_players.add(player_index)
             matched_boxes.add(box_index)
+        for player in players:
+            if player.seen != now and not player.missing:
+                player.missing = True
+                SYSTEM_LOG.log(
+                    "rastreio",
+                    f"#{player.id:02d} sinal perdido; canal{player.slot} reservado por "
+                    f"{CAIPIRA_TRACK_GRACE:g} s",
+                )
+            elif player.seen == now and player.missing:
+                player.missing = False
+                SYSTEM_LOG.log("rastreio", f"#{player.id:02d} sinal recuperado")
+        for player in players:
+            if now - player.seen > CAIPIRA_TRACK_GRACE:
+                SYSTEM_LOG.log(
+                    "rastreio",
+                    f"#{player.id:02d} saiu de cena -> canal{player.slot} "
+                    f"{self.channel_name(player.slot)} livre",
+                )
         players = [player for player in players if now - player.seen <= CAIPIRA_TRACK_GRACE]
         taken = {player.slot for player in players}
         free = [slot for slot in sorted(slots) if slot not in taken]
         for box_index, box in enumerate(boxes):
             if box_index not in matched_boxes and free:
-                index = int(self._rng.integers(len(free))) if random_slot else 0
-                players.append(ViolaPlayer(box, free.pop(index), now))
+                choices = len(free)
+                index = int(self._rng.integers(choices)) if random_slot else 0
+                player = ViolaPlayer(box, free.pop(index), now)
+                players.append(player)
+                x0, y0, x1, y1 = box
+                SYSTEM_LOG.log(
+                    "rastreio",
+                    f"#{player.id:02d} corpo detectado em ({(x0 + x1) / 2:.0f}, "
+                    f"{(y0 + y1) / 2:.0f}), {x1 - x0}x{y1 - y0} px -> canal{player.slot} "
+                    f"{self.channel_name(player.slot)}"
+                    + (f" (sorteado entre {choices} livres)" if random_slot else ""),
+                )
         magnitude = None if flow is None else np.hypot(flow[..., 0], flow[..., 1])
         for player in players:
             player.motion = 0.0
@@ -3561,11 +3707,14 @@ class VisionProcessor:
         self._toada_clock = now
         positions, moves = field.node_motion()
         displacement = np.hypot(moves[:, 0], moves[:, 1])
-        excitations = {}
+        excitations, owners = {}, {}
         for player in self._viola_players:
             player.excitation = 0.0
+            owners[player.slot] = player
             if player.seen != now:
                 continue
+            if self._yolo is not None:
+                player.score = self._people_yolo_scores.get(player.box)
             x0, y0, x1, y1 = player.box
             inside = (
                 (positions[:, 0] >= x0) & (positions[:, 0] <= x1)
@@ -3578,9 +3727,11 @@ class VisionProcessor:
                 excitations[player.slot] = player.excitation
         decay = 0.5 ** (dt / CAIPIRA_VOLUME_HALF_LIFE)
         for channel in channels:
-            level = self._toada_levels.get(channel, 0.0)
+            previous = level = self._toada_levels.get(channel, 0.0)
             excitation = excitations.get(channel, 0.0)
-            if excitation >= CAIPIRA_EXCITE_MIN:
+            name = f"canal{channel} {self.channel_name(channel)}"
+            active = excitation >= CAIPIRA_EXCITE_MIN
+            if active:
                 level = min(1.0, level + CAIPIRA_VOLUME_RISE * excitation * dt)
                 self._toada_excited[channel] = now
             elif now - self._toada_excited.get(channel, -math.inf) > CAIPIRA_VOLUME_HOLD:
@@ -3588,10 +3739,95 @@ class VisionProcessor:
                 if level < CAIPIRA_VOLUME_FLOOR:
                     level = 0.0
             self._toada_levels[channel] = level
+            # Eventos do canal no log: interacao comecando e parando, marcos do
+            # volume subindo e o silencio.
+            if active != self._toada_active.get(channel, False):
+                self._toada_active[channel] = active
+                if active:
+                    SYSTEM_LOG.log(
+                        "toada",
+                        f"{name} ▲ #{owners[channel].id:02d} excita as cordas "
+                        f"({excitation:.0%}); volume sobe {CAIPIRA_VOLUME_RISE * excitation:.2f}/s",
+                    )
+                else:
+                    SYSTEM_LOG.log(
+                        "toada",
+                        f"{name} ▼ sem interacao; decai em {CAIPIRA_VOLUME_HOLD:g} s, "
+                        f"meia-vida {CAIPIRA_VOLUME_HALF_LIFE:g} s",
+                    )
+            for mark in OBRA_VOLUME_MARKS:
+                if previous < mark <= level:
+                    SYSTEM_LOG.log(
+                        "toada",
+                        f"{name} ■ volume maximo" if mark >= 1.0 else f"{name} volume {mark:.0%}",
+                    )
+            if previous > 0.0 and level == 0.0:
+                SYSTEM_LOG.log("toada", f"{name} · silencio")
         self.channel_volumes = {channel: self._toada_levels[channel] for channel in channels}
         if self.arpeggios is not None:
             for channel, volume in self.channel_volumes.items():
                 self.arpeggios.set_volume(channel, volume)
+        source = "YOLO" if self._yolo is not None else self._people_source
+        self.toada_players = [
+            {
+                "id": player.id,
+                "box": player.box,
+                "slot": player.slot,
+                "name": self.channel_name(player.slot),
+                "seen": player.seen == now,
+                "score": player.score if self._yolo is not None else None,
+                "source": source,
+                "excitation": player.excitation,
+                "volume": self.channel_volumes.get(player.slot, 0.0),
+            }
+            for player in self._viola_players
+        ]
+        self.toada_channels = [
+            {
+                "slot": channel,
+                "name": self.channel_name(channel),
+                "owner": owners[channel].id if channel in owners else None,
+                "excitation": owners[channel].excitation if channel in owners else 0.0,
+                "volume": self.channel_volumes[channel],
+            }
+            for channel in channels
+        ]
+
+    @property
+    def pulse_count(self) -> int:
+        """Pulsos de neon vivos no xadrez (0 nos modos sem xadrez)."""
+        return self._field.pulse_count if isinstance(self._field, PlaidStack) else 0
+
+    def _report_vision(self, flow: Optional[np.ndarray], mask: Optional[np.ndarray]) -> None:
+        """Caipira: resumo da visao no log a cada OBRA_TELEMETRY_INTERVAL s."""
+        now = self._viola_now
+        if now - self._vision_report < OBRA_TELEMETRY_INTERVAL:
+            return
+        self._vision_report = now
+        _, moves = self._field.node_motion()
+        displacement = np.hypot(moves[:, 0], moves[:, 1])
+        moved = float((displacement > 1.0).mean()) if len(displacement) else 0.0
+        speed = 0.0 if flow is None else float(np.hypot(flow[..., 0], flow[..., 1]).mean())
+        SYSTEM_LOG.log(
+            "visao",
+            f"fluxo {speed:.2f} px/quadro, {moved:.0%} dos {len(displacement)} nos "
+            f"deslocados, desordem {self.line_disorder:.0%}, pulsos {self._field.pulse_count}",
+        )
+        SYSTEM_LOG.log(
+            "visao",
+            f"corpos {self._people_source} {self.people_count}"
+            + (
+                ""
+                if self.people_count_yolo is None
+                else f" / YOLO {self.people_count_yolo} em {self._yolo_ms:.0f} ms"
+            )
+            + ("" if mask is None else f", silhueta {float((mask > 0).mean()):.0%} do quadro"),
+        )
+
+    def channel_name(self, slot: int) -> str:
+        """Nome da faixa do canal (do arquivo, sem o "canalN"), ou "canalN"."""
+        names = self.arpeggios.names if self.arpeggios is not None else self._channel_names
+        return names.get(slot, f"canal{slot}")
 
     def _mix_arpeggios(
         self,
@@ -4838,6 +5074,7 @@ class VisionProcessor:
                 self._count_people_yolo(frame_bgr)
             boxes = self._people_yolo_boxes if self._yolo is not None else self._people_boxes
             self._play_toada(boxes, flow, scale, (width, height), self._field)
+            self._report_vision(flow, small)
         # A silhueta fica por baixo, sobre o preto; linhas e pulsos sao desenhados
         # por cima.
         if self.mode in PLAID_MODES and self.silhouette:
@@ -5170,11 +5407,9 @@ def mp3_gapless(data: bytes) -> Optional[tuple[int, int]]:
     return delay + MP3_DECODER_DELAY, frames * samples_per_frame - delay - padding
 
 
-def load_viola_channels(directory: str, sample_rate: int) -> dict[int, np.ndarray]:
-    """Arpejo de cada canal (1 a VIOLA_CHANNELS), mono, pelo "canalN" no nome."""
-    import miniaudio
-
-    channels: dict[int, np.ndarray] = {}
+def viola_channel_files(directory: str) -> dict[int, str]:
+    """Arquivo de cada canal (1 a VIOLA_CHANNELS), pelo "canalN" no nome."""
+    files: dict[int, str] = {}
     for name in sorted(os.listdir(directory)):
         match = re.search(r"canal(\d+)", name.lower())
         if match is None or not name.lower().endswith(VIOLA_EXTENSIONS):
@@ -5182,9 +5417,36 @@ def load_viola_channels(directory: str, sample_rate: int) -> dict[int, np.ndarra
         channel = int(match.group(1))
         if not 1 <= channel <= VIOLA_CHANNELS:
             continue
-        if channel in channels:
+        if channel in files:
             print(f"Aviso: canal{channel} repetido; ignorando {name}.", file=sys.stderr)
             continue
+        files[channel] = name
+    return files
+
+
+def viola_channel_name(file_name: str) -> str:
+    """Nome da faixa: o arquivo sem extensao e sem o "canalN" (canal3_batuque.mp3 -> batuque)."""
+    stem = os.path.splitext(file_name)[0]
+    name = re.sub(r"(?i)^.*?canal\d+[\s_.-]*", "", stem)
+    return name or stem
+
+
+def viola_channel_names(directory: str) -> dict[int, str]:
+    """Nome da faixa de cada canal; vazio se a pasta nao existe."""
+    if not os.path.isdir(directory):
+        return {}
+    return {
+        channel: viola_channel_name(name)
+        for channel, name in viola_channel_files(directory).items()
+    }
+
+
+def load_viola_channels(directory: str, sample_rate: int) -> dict[int, np.ndarray]:
+    """Arpejo de cada canal (1 a VIOLA_CHANNELS), mono, pelo "canalN" no nome."""
+    import miniaudio
+
+    channels: dict[int, np.ndarray] = {}
+    for channel, name in viola_channel_files(directory).items():
         with open(os.path.join(directory, name), "rb") as sound_file:
             data = sound_file.read()
         sound = miniaudio.decode(
@@ -5214,6 +5476,12 @@ def load_viola_channels(directory: str, sample_rate: int) -> dict[int, np.ndarra
         if peak > 0:
             samples *= VIOLA_CHANNEL_PEAK / peak
         channels[channel] = samples
+        SYSTEM_LOG.log(
+            "audio",
+            f"canal{channel} {viola_channel_name(name)}: {name}, {len(samples)} amostras "
+            f"({len(samples) / sample_rate:.3f} s a {sample_rate} Hz), pico {peak:.2f} -> "
+            f"{VIOLA_CHANNEL_PEAK:g}",
+        )
     lengths = {round(len(loop) / sample_rate, 2) for loop in channels.values()}
     if len(lengths) > 1:
         print(
@@ -5249,6 +5517,11 @@ class ViolaArpeggios:
             raise RuntimeError(
                 f"nenhum arquivo com canal1 a canal{VIOLA_CHANNELS} no nome em {directory}"
             )
+        self.names = {
+            channel: name
+            for channel, name in viola_channel_names(directory).items()
+            if channel in self.channels
+        }
         self.error: Optional[str] = None
         self._targets = dict.fromkeys(self.channels, 0.0)
         self.volumes = dict.fromkeys(self.channels, 0.0)
@@ -5276,6 +5549,13 @@ class ViolaArpeggios:
                 latency=VIOLA_LATENCY,
             )
             self._stream.start()
+            device = sounddevice.query_devices(self._stream.device)["name"]
+            SYSTEM_LOG.log(
+                "audio",
+                f"saida: {device}, {sample_rate} Hz mono, latencia "
+                f"{self._stream.latency * 1000:.0f} ms; {len(self.channels)} canais em "
+                "loop, sincronizados, mudos",
+            )
         except Exception as exc:
             self._stream = None
             self.error = f"{type(exc).__name__}: {exc}"
@@ -5399,9 +5679,17 @@ class SilhouetteShape:
 class ViolaPlayer:
     """Pessoa rastreada no caipira, na viola ou na roda, com o canal que ela toca."""
 
+    # Numero de cada pessoa rastreada desde a partida, para o log e as caixas.
+    _ids = itertools.count(1)
+
     def __init__(self, box: tuple[int, int, int, int], slot: int, now: float) -> None:
+        self.id = next(ViolaPlayer._ids)
         # Canal da toada (caipira) ou de arpejo (viola, roda).
         self.slot = slot
+        # Confianca media dos keypoints do YOLO na ultima deteccao (None: mascara).
+        self.score: Optional[float] = None
+        # Fora da deteccao, mas ainda dentro de CAIPIRA_TRACK_GRACE.
+        self.missing = False
         self.seen = now
         self.motion = 0.0
         # Caipira: excitacao das cordas na caixa (0 a 1) no ultimo quadro.
@@ -5569,6 +5857,308 @@ def latency_color(latency_ms: float) -> tuple[int, int, int]:
 def make_body_visual(mask: np.ndarray) -> np.ndarray:
     zeros = np.zeros_like(mask)
     return cv2.merge((zeros, zeros, mask))
+
+
+def hue_bgr(hue: float, saturation_value: tuple[float, float]) -> tuple[int, int, int]:
+    """Cor BGR do matiz (graus) com a saturacao e o brilho dados (0 a 1)."""
+    red, green, blue = colorsys.hsv_to_rgb((hue % 360.0) / 360.0, *saturation_value)
+    return (round(255 * blue), round(255 * green), round(255 * red))
+
+
+def meter(fraction: float, cells: int) -> str:
+    """Barra de nivel em blocos: cheio ate fraction, vazado no resto."""
+    full = round(min(1.0, max(0.0, fraction)) * cells)
+    return "█" * full + "░" * (cells - full)
+
+
+def find_mono_font() -> Optional[str]:
+    for directory in OBRA_FONT_DIRS:
+        for name in OBRA_FONTS:
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+class MonoText:
+    """Texto monoespacado: fonte TrueType pelo Pillow, ou a Hershey do OpenCV."""
+
+    # A Hershey so tem ASCII: blocos e acentos viram equivalentes.
+    _ASCII = str.maketrans(
+        {"█": "#", "░": ".", "─": "-", "▌": "|", "▲": "^",
+         "▼": "v", "■": "*", "·": "-", "→": ">"}
+    )
+
+    def __init__(self, size: int) -> None:
+        self._font = None
+        self._masks: dict[str, np.ndarray] = {}
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+
+            path = find_mono_font()
+            if path is not None:
+                self._font = ImageFont.truetype(path, size)
+                self._image_module, self._draw_module = Image, ImageDraw
+                self.char_width = self._font.getlength("M")
+                self.line_height = round(size * 1.3)
+                self.label = os.path.basename(path)
+        except Exception:
+            self._font = None
+        if self._font is None:
+            self._scale = size / 13.0
+            (width, _), _ = cv2.getTextSize("M", cv2.FONT_HERSHEY_PLAIN, self._scale, 1)
+            self.char_width = float(width)
+            self.line_height = round(size * 1.4)
+            self.label = "Hershey"
+
+    def draw(
+        self, image: np.ndarray, lines: list[tuple[float, float, str, tuple[int, int, int]]]
+    ) -> None:
+        """Escreve (x, y do topo, texto, cor BGR) na imagem BGR, no lugar."""
+        if not lines:
+            return
+        if self._font is None:
+            import unicodedata
+
+            for x, y, text, color in lines:
+                text = unicodedata.normalize("NFKD", text.translate(self._ASCII))
+                text = text.encode("ascii", "ignore").decode()
+                cv2.putText(
+                    image, text, (round(x), round(y + self.line_height * 0.75)),
+                    cv2.FONT_HERSHEY_PLAIN, self._scale, color, 1, cv2.LINE_AA,
+                )
+            return
+        height, width = image.shape[:2]
+        for x, y, text, color in lines:
+            mask = self._mask(text)
+            x0, y0 = round(x), round(y)
+            x1, y1 = min(width, x0 + mask.shape[1]), min(height, y0 + mask.shape[0])
+            if x1 <= x0 or y1 <= y0:
+                continue
+            alpha = mask[: y1 - y0, : x1 - x0, None] * np.float32(1.0 / 255.0)
+            region = image[y0:y1, x0:x1]
+            region[:] = region + (np.asarray(color, np.float32) - region) * alpha
+
+    def _mask(self, text: str) -> np.ndarray:
+        """Texto rasterizado uma vez (cinza 0 a 255, altura line_height) e guardado:
+        as linhas do log e os valores dos rotulos se repetem muito."""
+        mask = self._masks.get(text)
+        if mask is None:
+            if len(self._masks) > 4000:
+                self._masks.clear()
+            canvas = self._image_module.new(
+                "L", (max(1, math.ceil(self._font.getlength(text))), self.line_height)
+            )
+            self._draw_module.Draw(canvas).text((0, 0), text, font=self._font, fill=255)
+            mask = self._masks[text] = np.asarray(canvas)
+        return mask
+
+
+class ObraScreen:
+    """Janela do projetor no caipira: terminal de log a esquerda, obra a direita.
+
+    O terminal mostra o estado dos canais e o SYSTEM_LOG rolando, e e redesenhado
+    no maximo OBRA_LOG_FPS vezes por segundo; as caixas dos corpos sao desenhadas
+    na obra a cada quadro. Tudo no matiz atual das linhas.
+    """
+
+    def __init__(self, log: SystemLog = SYSTEM_LOG) -> None:
+        self._log = log
+        self._text: Optional[MonoText] = None
+        self._text_height = 0
+        self._panel: Optional[np.ndarray] = None
+        self._panel_time = -math.inf
+
+    def compose(
+        self,
+        art: np.ndarray,
+        players: list[dict],
+        channels: list[dict],
+        hue: float,
+        status: dict,
+    ) -> np.ndarray:
+        height, width = art.shape[:2]
+        panel_width = round(width * OBRA_LOG_FRACTION / (1.0 - OBRA_LOG_FRACTION))
+        if self._text is None or self._text_height != height:
+            self._text = MonoText(max(9, height // OBRA_LOG_ROWS))
+            self._text_height = height
+            self._log.log(
+                "tela",
+                f"obra {width}x{height} + terminal {panel_width}px "
+                f"({OBRA_LOG_FRACTION:.0%}), fonte {self._text.label}",
+            )
+        canvas = np.empty((height, panel_width + width, 3), dtype=np.uint8)
+        canvas[:, panel_width:] = art
+        self._draw_players(canvas[:, panel_width:], players, hue)
+        now = time.perf_counter()
+        if (
+            self._panel is None
+            or self._panel.shape[:2] != (height, panel_width)
+            or now - self._panel_time >= 1.0 / OBRA_LOG_FPS
+        ):
+            self._panel = self._render_panel(height, panel_width, channels, hue, status, now)
+            self._panel_time = now
+        canvas[:, :panel_width] = self._panel
+        return canvas
+
+    def _render_panel(
+        self, height: int, width: int, channels: list[dict], hue: float, status: dict, now: float
+    ) -> np.ndarray:
+        text = self._text
+        bright = hue_bgr(hue, OBRA_BRIGHT_SV)
+        dim = hue_bgr(hue, OBRA_DIM_SV)
+        background = hue_bgr(hue, OBRA_BACKGROUND_SV)
+        panel = np.empty((height, width, 3), dtype=np.uint8)
+        panel[:] = background
+        pad = max(6, round(text.char_width))
+        columns = max(10, int((width - 2 * pad) // text.char_width))
+        rule = "─" * columns
+        lines = []
+        y = float(pad)
+
+        def put(line: str, color: tuple[int, int, int]) -> None:
+            nonlocal y
+            lines.append((pad, y, line[:columns], color))
+            y += text.line_height
+
+        put("▌ SOMOS TEIA :: CAIPIRA", bright)
+        put(f"sys.log  t+{status.get('elapsed', 0.0):.1f} s", dim)
+        put(
+            f"{status.get('fps', 0.0):5.1f} fps  {status.get('latency', 0.0):4.0f} ms  "
+            f"{status.get('source', '')}",
+            dim,
+        )
+        put(
+            f"corpos {status.get('people', '-')}  desordem {status.get('disorder', 0.0):4.0%}  "
+            f"pulsos {status.get('pulses', 0)}",
+            dim,
+        )
+        put(rule, dim)
+        put("CH FAIXA     DONO CORDAS VOLUME", dim)
+        cells = max(4, columns - 26)
+        for channel in channels:
+            owner = f"#{channel['owner']:02d}" if channel["owner"] is not None else " -- "
+            put(
+                f"{channel['slot']:>2} {channel['name'][:9]:<9} {owner:>4} "
+                f"{channel['excitation']:5.0%}  {meter(channel['volume'], cells)} "
+                f"{channel['volume']:4.0%}",
+                bright if channel["volume"] > 0 or channel["owner"] is not None else dim,
+            )
+        put(rule, dim)
+        # Log: as entradas mais novas embaixo, quebradas na largura do terminal.
+        rows = max(1, int((height - y - pad) // text.line_height))
+        wrapped: list[tuple[str, bool]] = []
+        for moment, topic, message in self._log.tail(rows):
+            alert = topic in ("aviso", "erro")
+            for line in textwrap.wrap(
+                f"[{moment:07.2f}] {topic}: {message}", columns, subsequent_indent="   "
+            ):
+                wrapped.append((line, alert))
+        wrapped = wrapped[-rows:]
+        for index, (line, alert) in enumerate(wrapped):
+            # Mais antiga, mais apagada; avisos mais brancos.
+            age = (index + 1) / len(wrapped)
+            strength = OBRA_LOG_FADE + (1.0 - OBRA_LOG_FADE) * age
+            tone = hue_bgr(hue, (0.25, 1.0)) if alert else bright
+            color = tuple(round(b + (t - b) * strength) for b, t in zip(background, tone))
+            if index == len(wrapped) - 1 and int(now * 2) % 2 == 0:
+                line = (line + " █")[:columns]
+            put(line, color)
+        text.draw(panel, lines)
+        # Scanlines e a borda que separa o terminal da obra.
+        panel[::3] = (panel[::3] * 0.78).astype(np.uint8)
+        panel[:, -2:] = dim
+        return panel
+
+    @staticmethod
+    def _free_spot(
+        x: int,
+        width: int,
+        height: int,
+        preferred: tuple[int, ...],
+        limit: int,
+        placed: list[tuple[int, int, int, int]],
+    ) -> int:
+        """Topo do rotulo: o primeiro de preferred (acima, dentro, abaixo da caixa)
+        que cabe no quadro sem cobrir outro rotulo; senao, empilhado sob os outros."""
+
+        def clear(y: int) -> bool:
+            return all(
+                x + width <= ox0 or x >= ox1 or y + height <= oy0 or y >= oy1
+                for ox0, oy0, ox1, oy1 in placed
+            )
+
+        for y in preferred:
+            if 0 <= y <= limit - height and clear(y):
+                return y
+        y = min(max(0, preferred[0]), max(0, limit - height))
+        while not clear(y) and y + height < limit:
+            y = max(oy1 for ox0, oy0, ox1, oy1 in placed
+                    if not (x + width <= ox0 or x >= ox1 or y + height <= oy0 or y >= oy1)) + 2
+        return min(y, max(0, limit - height))
+
+    def _draw_players(self, art: np.ndarray, players: list[dict], hue: float) -> None:
+        text = self._text
+        height, width = art.shape[:2]
+        bright = hue_bgr(hue, OBRA_BRIGHT_SV)
+        dim = hue_bgr(hue, OBRA_DIM_SV)
+        background = np.array(hue_bgr(hue, OBRA_BACKGROUND_SV), dtype=np.float32)
+        # Rotulos ja colocados (x0, y0, x1, y1): o seguinte procura um lugar livre.
+        placed: list[tuple[int, int, int, int]] = []
+        for player in players:
+            x0, y0, x1, y1 = player["box"]
+            x0, x1 = max(0, x0), min(width - 1, x1)
+            y0, y1 = max(0, y0), min(height - 1, y1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            excited = player["excitation"] >= CAIPIRA_EXCITE_MIN
+            color = dim if not player["seen"] else bright
+            thickness = 3 if excited else 2
+            arm = max(8, round(0.2 * min(x1 - x0, y1 - y0)))
+            # Colchetes nos cantos; com as cordas excitadas, a caixa se fecha.
+            for cx, cy, dx, dy in (
+                (x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)
+            ):
+                cv2.line(art, (cx, cy), (cx + dx * arm, cy), color, thickness, cv2.LINE_AA)
+                cv2.line(art, (cx, cy), (cx, cy + dy * arm), color, thickness, cv2.LINE_AA)
+            if excited:
+                cv2.rectangle(art, (x0, y0), (x1, y1), color, 1, cv2.LINE_AA)
+            if player["score"] is not None:
+                detection = f"YOLO {player['score']:.0%}"
+            else:
+                detection = player["source"]
+            labels = [
+                f"#{player['id']:02d} CORPO {detection}"
+                if player["seen"]
+                else f"#{player['id']:02d} SINAL PERDIDO",
+                f"CORDAS {meter(player['excitation'], 8)} {player['excitation']:4.0%}",
+                f"{player['name'].upper()} · CANAL {player['slot']}",
+                f"VOLUME {meter(player['volume'], 8)} {player['volume']:4.0%}",
+            ]
+            pad = 4
+            label_width = round(max(len(label) for label in labels) * text.char_width) + 2 * pad
+            label_height = len(labels) * text.line_height + pad
+            lx = min(max(0, x0), max(0, width - label_width))
+            ly = self._free_spot(
+                lx, label_width, label_height, (y0 - label_height - 4, y0 + 4, y1 + 4),
+                height, placed,
+            )
+            placed.append((lx, ly, lx + label_width, ly + label_height))
+            region = art[ly : ly + label_height, lx : lx + label_width]
+            if region.size == 0:
+                continue
+            # Fundo escuro translucido, borda no matiz e o texto por cima.
+            region[:] = (region * 0.3 + background * 0.7).astype(np.uint8)
+            cv2.rectangle(
+                region, (0, 0), (region.shape[1] - 1, region.shape[0] - 1), color, 1
+            )
+            text.draw(
+                region,
+                [
+                    (pad, pad // 2 + row * text.line_height, label, color)
+                    for row, label in enumerate(labels)
+                ],
+            )
 
 
 def draw_debug_overlay(
@@ -6175,6 +6765,17 @@ def display_problem() -> Optional[str]:
 
 def main() -> int:
     args = parse_args()
+    # A obra (caipira): tela em duas colunas, e o terminal dela mostra tudo o que
+    # o programa imprime, alem dos eventos registrados no SYSTEM_LOG.
+    obra = args.mode == "caipira"
+    if obra:
+        sys.stdout = LogTee(sys.stdout, "sys")
+        sys.stderr = LogTee(sys.stderr, "aviso")
+        SYSTEM_LOG.log(
+            "sys",
+            f"somos-teia {' '.join(sys.argv[1:]) or '(sem argumentos)'} | python "
+            f"{sys.version.split()[0]} | opencv {cv2.__version__} | numpy {np.__version__}",
+        )
     problem = display_problem()
     if problem is not None:
         print(f"Erro: {problem}", file=sys.stderr)
@@ -6187,7 +6788,11 @@ def main() -> int:
         print(f"Erro ao iniciar captura: {exc}", file=sys.stderr)
         return 1
     active_mode = resolve_active_mode(args.mode, capturer)
+    SYSTEM_LOG.log("captura", f"fonte {capturer.source_label}, modo {active_mode}")
     render = PI_PLAID_RENDER if args.pi else PlaidRender()
+    if obra:
+        # Sem janela de debug, o processador nem compoe o quadro dela.
+        render = dataclasses.replace(render, debug_output=False)
     metronome = Metronome(args.bpm, args.metronome)
     arpeggios = make_viola_arpeggios(active_mode, args.viola)
     try:
@@ -6239,7 +6844,13 @@ def main() -> int:
             source_choices.append(video_choice)
     projector_window = "Projetor 2 - Corpo/Frontal"
     # No --pi so a janela do projetor: a de debug custaria outro imshow e o overlay.
-    windows = (projector_window,) if args.pi else ("Debug & Tracking", projector_window)
+    # Na obra tambem: as caixas, a interacao e o volume ficam na propria tela.
+    windows = (
+        (projector_window,) if args.pi or obra else ("Debug & Tracking", projector_window)
+    )
+    obra_screen = ObraScreen() if obra else None
+    if obra:
+        SYSTEM_LOG.log("visao", processor.label)
     for window in windows:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     # Sem --fullscreen explicito, so o perfil --pi (que roda no projetor) abre em tela cheia.
@@ -6285,7 +6896,40 @@ def main() -> int:
                     if len(recent_frame_times) > 1
                     else 0.0
                 )
-                if args.pi:
+                if obra_screen is not None:
+                    status = {
+                        "elapsed": SYSTEM_LOG.elapsed(),
+                        "fps": fps,
+                        "latency": last_latency_ms,
+                        "source": capturer.source_label,
+                        "people": f"{processor.people_count}"
+                        + (
+                            ""
+                            if processor.people_count_yolo is None
+                            else f"/{processor.people_count_yolo}"
+                        ),
+                        "disorder": processor.line_disorder,
+                        "pulses": processor.pulse_count,
+                    }
+                    cv2.imshow(
+                        projector_window,
+                        obra_screen.compose(
+                            body,
+                            processor.toada_players,
+                            processor.toada_channels,
+                            processor.plaid_hue,
+                            status,
+                        ),
+                    )
+                    now = time.perf_counter()
+                    if now - last_status_report >= OBRA_TELEMETRY_INTERVAL:
+                        last_status_report = now
+                        SYSTEM_LOG.log(
+                            "tela",
+                            f"{fps:.1f} fps, latencia {last_latency_ms:.0f} ms, quadro "
+                            f"{body.shape[1]}x{body.shape[0]}, {metronome.label}",
+                        )
+                elif args.pi:
                     cv2.imshow(projector_window, body)
                     now = time.perf_counter()
                     if now - last_status_report >= PI_STATUS_INTERVAL:
@@ -6318,6 +6962,8 @@ def main() -> int:
             key = cv2.waitKey(1) & 0xFF
             if is_new_frame:
                 last_latency_ms = (time.perf_counter() - frame_start) * 1000.0
+            if obra and key != 0xFF:
+                SYSTEM_LOG.log("tecla", repr(chr(key)))
             if key == ord("q"):
                 break
             # Metronomo: teclas globais, valem em todos os modos.
