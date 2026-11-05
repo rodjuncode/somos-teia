@@ -1175,6 +1175,65 @@ def create_capturer(
     return VideoCapturer(source)
 
 
+# Transicoes dos parametros ajustados pelo teclado (densidade, ganho, rotacao, matiz,
+# sensibilidade, brilho da camera, forca, feixe e volta do paisagens): cada valor
+# segue o alvo como uma mola criticamente amortecida, que parte devagar, acelera e
+# chega sem passar do alvo (um ease in-out) em ~PARAM_EASE_SECONDS (99% do caminho).
+# Um toque no meio da transicao muda o alvo e a mola herda a velocidade: toques
+# seguidos deslizam, sem recomecar do zero. As teclas e os rotulos mostram o alvo.
+PARAM_EASE_SECONDS = 0.6
+# Resposta da mola: y(t) = y0 (1 + w t) e^(-w t); w t = 6,64 deixa 1% do caminho.
+PARAM_EASE_OMEGA = 6.64 / PARAM_EASE_SECONDS
+
+
+class Smoothed:
+    """Valor que segue um alvo como mola criticamente amortecida (ease in-out).
+
+    period: valor circular (graus), que vai pelo caminho mais curto; log: anda em
+    escala logaritmica, para parametros de passo multiplicativo. Abaixo de epsilon
+    (na escala da mola) o valor gruda no alvo exato.
+    """
+
+    def __init__(
+        self,
+        value: float,
+        period: Optional[float] = None,
+        log: bool = False,
+        epsilon: float = 1e-3,
+    ) -> None:
+        self._period = period
+        self._log = log
+        self._epsilon = epsilon
+        self._position = math.log(value) if log else value
+        self._velocity = 0.0
+        self.value = value
+
+    def step(self, target: float, dt: float) -> float:
+        """Avanca dt segundos rumo ao alvo e devolve o valor atual."""
+        goal = math.log(target) if self._log else target
+        offset = self._position - goal
+        if self._period is not None:
+            offset = (offset + self._period / 2.0) % self._period - self._period / 2.0
+        if abs(offset) < self._epsilon and abs(self._velocity) < 4.0 * self._epsilon:
+            self._position, self._velocity, self.value = goal, 0.0, target
+            return target
+        # Solucao exata da mola criticamente amortecida: estavel com qualquer dt.
+        decay = math.exp(-PARAM_EASE_OMEGA * dt)
+        push = (self._velocity + PARAM_EASE_OMEGA * offset) * dt
+        offset = (offset + push) * decay
+        self._velocity = (self._velocity - PARAM_EASE_OMEGA * push) * decay
+        self._position = goal + offset
+        value = math.exp(self._position) if self._log else self._position
+        if self._period is not None:
+            value %= self._period
+        self.value = value
+        return value
+
+    @property
+    def moving(self) -> bool:
+        return self._velocity != 0.0
+
+
 class SystemLog:
     """Registro do que o programa faz, mostrado no terminal da obra.
 
@@ -1640,8 +1699,15 @@ class ElasticLines:
         tints: np.ndarray,
         thicknesses: np.ndarray,
         segment_samples: int = PLAID_SEGMENT_SAMPLES,
+        keys: Optional[np.ndarray] = None,
+        steps: Optional[np.ndarray] = None,
     ) -> None:
         self._segment_samples = segment_samples
+        # Posicao de cada linha no sett, independente da densidade e da rotacao (a
+        # mesma linha tem a mesma chave em qualquer malha do mesmo padrao), e a
+        # coordenada de cada no ao longo da linha, em px a partir do centro.
+        self.keys = keys
+        self.steps = steps
         self._basis = (
             PLAID_SEGMENT_BASIS
             if segment_samples == PLAID_SEGMENT_SAMPLES
@@ -1671,6 +1737,43 @@ class ElasticLines:
     def reset(self) -> None:
         self._displacement[:] = 0.0
         self._velocity[:] = 0.0
+
+    def adopt(self, old: "ElasticLines") -> Optional[np.ndarray]:
+        """Herda a deformacao de old: cada linha casa com a de mesma chave e cada no
+        com o de mesma coordenada ao longo da linha; o resto fica em repouso.
+
+        Devolve, para cada linha de old, a linha correspondente aqui (-1 se sumiu).
+        """
+        if (
+            self.keys is None or old.keys is None or self.steps is None or old.steps is None
+            or len(self) == 0 or len(old) == 0 or len(old.steps) < 2
+        ):
+            return None
+        order = np.argsort(old.keys)
+        sorted_keys = old.keys[order]
+        index = np.clip(np.searchsorted(sorted_keys, self.keys), 0, len(sorted_keys) - 1)
+        below = np.maximum(index - 1, 0)
+        nearest = np.where(
+            np.abs(sorted_keys[below] - self.keys) < np.abs(sorted_keys[index] - self.keys),
+            below,
+            index,
+        )
+        matched = np.abs(sorted_keys[nearest] - self.keys) < 1e-6
+        new_lines = np.flatnonzero(matched)
+        old_lines = order[nearest[matched]]
+        spacing = float(old.steps[1] - old.steps[0])
+        nodes = np.rint((self.steps - old.steps[0]) / spacing).astype(np.intp)
+        valid = (nodes >= 0) & (nodes < len(old.steps))
+        rows = np.ix_(new_lines, np.flatnonzero(valid))
+        source = np.ix_(old_lines, nodes[valid])
+        self._displacement[rows] = old._displacement[source]
+        self._velocity[rows] = old._velocity[source]
+        # As pontas sao fixas.
+        self._displacement[:, [0, -1]] = 0.0
+        self._velocity[:, [0, -1]] = 0.0
+        line_map = np.full(len(old), -1, dtype=np.intp)
+        line_map[old_lines] = new_lines
+        return line_map
 
     def update(
         self, flow: Optional[np.ndarray], scale: np.ndarray, threshold: float, gain: float
@@ -1757,6 +1860,58 @@ class NeonPulses:
 
     def __len__(self) -> int:
         return len(self._position)
+
+    def adopt(
+        self,
+        old: "NeonPulses",
+        line_maps: list[Optional[np.ndarray]],
+        old_families: tuple,
+        families: tuple,
+    ) -> None:
+        """Herda os pulsos de old: cada um vai para a linha correspondente, no mesmo
+        ponto ao longo dela; os de linhas que sumiram acabam."""
+        self.speed_scale = old.speed_scale
+        if len(old) == 0:
+            return
+        line = np.full(len(old), -1, dtype=np.intp)
+        for family, line_map in enumerate(line_maps):
+            if line_map is None:
+                continue
+            chosen = old._family == family
+            line[chosen] = line_map[old._line[chosen]]
+        alive = line >= 0
+        if not alive.any():
+            return
+        family = old._family[alive]
+        reverse = old._reverse[alive]
+        # Amostra da cabeca -> px ao longo da linha -> amostra na linha nova.
+        def geometry(source: tuple) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            start = np.array([f.steps[0] for f in source], dtype=np.float32)
+            spacing = np.array([f.steps[1] - f.steps[0] for f in source], dtype=np.float32)
+            per_node = np.array([f._segment_samples for f in source], dtype=np.float32)
+            return start, spacing, per_node
+
+        old_start, old_spacing, old_per_node = geometry(old_families)
+        new_start, new_spacing, new_per_node = geometry(families)
+        old_last = old._sample_counts[family] - 1.0
+        head = np.where(reverse, old_last - old._position[alive], old._position[alive])
+        along = old_start[family] + head / old_per_node[family] * old_spacing[family]
+        head = (along - new_start[family]) / new_spacing[family] * new_per_node[family]
+        last = self._sample_counts[family] - 1.0
+        keep = slice(0, max(0, self._render.pulse_max - len(self)))
+        count = len(family[keep])
+        if count == 0:
+            return
+        self._append(
+            family[keep],
+            line[alive][keep],
+            np.where(reverse, last - head, head)[keep],
+            old._speed[alive][keep],
+            old._tail[alive][keep],
+            reverse[keep],
+        )
+        # A cauda continua do tamanho que ja tinha.
+        self._traveled[-count:] = old._traveled[alive][keep]
 
     def clear(self) -> None:
         self._family = np.empty(0, dtype=np.intp)
@@ -1947,6 +2102,7 @@ class PlaidField:
                 (repeats[:, None] - phase) * period_px + offsets[None] * unit
             ).ravel()
             visible = np.abs(positions) <= reach
+            keys = ((repeats[:, None] - phase) * period + offsets[None]).ravel()[visible]
             line_tints = np.tile(tints, len(repeats))[visible]
             line_thicknesses = np.tile(thicknesses, len(repeats))[visible]
             # As pontas ficam PLAID_NODE_SPACING alem da borda do quadro.
@@ -1959,7 +2115,9 @@ class PlaidField:
                 + positions[visible, None, None].astype(np.float32) * across
             )
             families.append(
-                ElasticLines(rest, line_tints, line_thicknesses, render.segment_samples)
+                ElasticLines(
+                    rest, line_tints, line_thicknesses, render.segment_samples, keys, steps
+                )
             )
         self._families = tuple(families)
         self.pulses = NeonPulses(
@@ -1978,6 +2136,14 @@ class PlaidField:
         for family in self._families:
             family.reset()
         self.pulses.clear()
+
+    def adopt(self, old: "PlaidField") -> None:
+        """Herda a deformacao das linhas e os pulsos de old (mesmo padrao)."""
+        line_maps = [
+            family.adopt(old_family)
+            for family, old_family in zip(self._families, old._families)
+        ]
+        self.pulses.adopt(old.pulses, line_maps, old._families, self._families)
 
     def update(
         self, flow: Optional[np.ndarray], scale: np.ndarray, threshold: float, gain: float
@@ -2147,6 +2313,13 @@ class PlaidStack:
         for field, _ in self._layers:
             field.reset()
         self._touch_times.clear()
+
+    def adopt(self, old: "PlaidStack") -> None:
+        """Herda de old (mesma disposicao) a deformacao das linhas e os pulsos de cada
+        camada: a malha refeita com outra densidade ou rotacao continua de onde estava."""
+        for (field, _), (old_field, _) in zip(self._layers, old._layers):
+            field.adopt(old_field)
+        self.disorder = old.disorder
 
     def update(
         self, flow: Optional[np.ndarray], scale: np.ndarray, threshold: float
@@ -3085,6 +3258,21 @@ class VisionProcessor:
         # Inferencia que satura a CPU (OpenVINO ou PyTorch CPU).
         self.cpu_inference = False
         self._yolo_backend: Optional[str] = None
+        # Valores vivos dos parametros do teclado: os atributos acima sao os alvos
+        # (teclas e rotulos); a renderizacao le estes, que os seguem com easing.
+        self._live = {
+            "density": Smoothed(self.plaid_density, log=True),
+            "gain": Smoothed(self.plaid_gain),
+            "rotation": Smoothed(self.plaid_rotation, period=360.0, epsilon=0.01),
+            "hue": Smoothed(self.plaid_hue, period=360.0, epsilon=0.05),
+            "sensitivity": Smoothed(self.plaid_sensitivity, log=True),
+            "camera": Smoothed(self.camera_brightness),
+            "landscape_gain": Smoothed(self.landscape_gain),
+            "bristle": Smoothed(self.landscape_bristle_width, epsilon=0.01),
+            "regen_delay": Smoothed(self.landscape_regen_delay, epsilon=0.01),
+            "regen_time": Smoothed(self.landscape_regen_time, epsilon=0.01),
+        }
+        self._ease_clock: Optional[float] = None
         if mode == "mog2":
             self._reset_mog2()
         elif mode == "conexoes":
@@ -3285,6 +3473,45 @@ class VisionProcessor:
             min(LANDSCAPE_MAX_GAIN, max(0.0, self.landscape_gain + gain_delta)), 6
         )
 
+    def _ease_parameters(self) -> None:
+        """Leva os valores vivos rumo aos alvos do teclado (uma vez por quadro)."""
+        now = self.clock()
+        dt = 0.0 if self._ease_clock is None else min(now - self._ease_clock, 0.1)
+        self._ease_clock = now
+        for name, target in (
+            ("density", self.plaid_density),
+            ("gain", self.plaid_gain),
+            ("rotation", self.plaid_rotation),
+            ("hue", self.plaid_hue),
+            ("sensitivity", self.plaid_sensitivity),
+            ("camera", self.camera_brightness),
+            ("landscape_gain", self.landscape_gain),
+            ("bristle", self.landscape_bristle_width),
+            ("regen_delay", self.landscape_regen_delay),
+            ("regen_time", self.landscape_regen_time),
+        ):
+            self._live[name].step(target, dt)
+
+    @property
+    def live_hue(self) -> float:
+        """Matiz que esta na tela agora (segue plaid_hue com easing)."""
+        return self._live["hue"].value
+
+    def _plaid_field(self, width: int, height: int) -> PlaidStack:
+        """Xadrez do quadro, refeito quando muda o tamanho, a disposicao, a densidade
+        ou a rotacao. Durante as transicoes de densidade e rotacao ele e refeito a
+        cada quadro (~1 ms) e herda a deformacao e os pulsos do anterior."""
+        live = self._live
+        layout = (self.plaid_layout, live["density"].value, live["rotation"].value)
+        old = self._field
+        if old is None or old.size != (width, height) or old.layout != layout:
+            self._field = self._make_field(width, height)
+            if isinstance(old, PlaidStack) and old.size == (width, height) and (
+                old.layout[0] == self.plaid_layout
+            ):
+                self._field.adopt(old)
+        return self._field
+
     def adjust_camera_brightness(self, delta: float) -> None:
         """Caipira: brilho da camera atras do xadrez, de 0 (preto) a 1."""
         self.camera_brightness = round(
@@ -3293,7 +3520,7 @@ class VisionProcessor:
 
     def _camera_backdrop(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Imagem da camera no brilho atual: escalada ate 1, clareada por gama acima."""
-        brightness = self.camera_brightness
+        brightness = self._live["camera"].value
         if self._camera_lut[0] != brightness:
             levels = np.arange(256, dtype=np.float32) / 255.0
             levels = min(brightness, 1.0) * levels ** (1.0 / max(brightness, 1.0))
@@ -3472,6 +3699,7 @@ class VisionProcessor:
         self, frame_bgr: np.ndarray, body_mask: Optional[np.ndarray] = None
     ) -> VisionResult:
         """body_mask e a mascara de profundidade do Kinect, quando a fonte e Kinect."""
+        self._ease_parameters()
         if self.mode == JECA_MODE:
             return self._process_jeca(frame_bgr, body_mask)
         if self.mode == JECATATU_MODE:
@@ -3548,8 +3776,8 @@ class VisionProcessor:
                 height,
                 self._plaid_patterns,
                 self.plaid_layout,
-                self.plaid_density,
-                self.plaid_rotation,
+                self._live["density"].value,
+                self._live["rotation"].value,
                 # No jecatatu os pulsos so saem dos contatos; com as maos (xadrez),
                 # so dos toques: nenhum nasce sorteado.
                 0.0
@@ -3982,16 +4210,9 @@ class VisionProcessor:
         height: int,
     ) -> np.ndarray:
         """Xadrez do caipira mesclado as pinturas, conforme self.viola_blend."""
-        if (
-            self._field is None
-            or self._field.size != (width, height)
-            or self._field.layout
-            != (self.plaid_layout, self.plaid_density, self.plaid_rotation)
-        ):
-            self._field = self._make_field(width, height)
-        field = self._field
-        field.gain = self.plaid_gain
-        field.hue = self.plaid_hue
+        field = self._plaid_field(width, height)
+        field.gain = self._live["gain"].value
+        field.hue = self.live_hue
         field.disorder_pulses = True
         field.update(flow, scale, self.FLOW_THRESHOLD)
         now = self._viola_now
@@ -4642,15 +4863,9 @@ class VisionProcessor:
         self._assign_paintings()
         self._update_silhouette_masks(boxes, masks, now, width, height)
         events = self._update_contacts(self._extremities(frame_bgr, now), now, width, height)
-        if (
-            self._field is None
-            or self._field.size != (width, height)
-            or self._field.layout != (self.plaid_layout, self.plaid_density, self.plaid_rotation)
-        ):
-            self._field = self._make_field(width, height)
-        field = self._field
-        field.gain = self.plaid_gain
-        field.hue = self.plaid_hue
+        field = self._plaid_field(width, height)
+        field.gain = self._live["gain"].value
+        field.hue = self.live_hue
         flow, scale = self._contact_flow(width, height)
         field.update(flow, scale, self.FLOW_THRESHOLD)
         unit = height / 720.0
@@ -4713,7 +4928,7 @@ class VisionProcessor:
         halo = cv2.subtract(
             halo, cv2.multiply(halo, small, scale=(1.0 - JECATATU_GLOW_INSIDE) / 255.0)
         )
-        pure = np.array(plaid_palette(self.plaid_hue)[0], dtype=np.float64)
+        pure = np.array(plaid_palette(self.live_hue)[0], dtype=np.float64)
         color = (pure + JECATATU_GLOW_WHITE * (255.0 - pure)) * (JECATATU_GLOW_GAIN * player.glow)
         light = cv2.multiply(
             cv2.cvtColor(halo, cv2.COLOR_GRAY2BGR), (*color.tolist(), 0.0), scale=1.0 / 255.0
@@ -4981,7 +5196,7 @@ class VisionProcessor:
         height, width = frame_bgr.shape[:2]
         if small is None:
             small = self._silhouette_mask(frame_bgr, body_mask)
-        blue, green, red = plaid_palette(self.plaid_hue)[0]
+        blue, green, red = plaid_palette(self.live_hue)[0]
         if not self.render.soft_silhouette:
             # Borda dura: amplia so a mascara (1 canal) e recorta um quadro de cor
             # solida, ~40% mais barato que colorir e ampliar 3 canais.
@@ -5053,23 +5268,24 @@ class VisionProcessor:
         if self._field is None or self._field.size != (width, height):
             self._field = self._make_field(width, height)
             self._previous_gray = None
-        elif self.mode in PLAID_MODES and self._field.layout != (
-            self.plaid_layout,
-            self.plaid_density,
-            self.plaid_rotation,
-        ):
-            self._field = self._make_field(width, height)
+        elif self.mode in PLAID_MODES:
+            self._plaid_field(width, height)
         if self.mode in PLAID_MODES:
-            self._field.gain = self.plaid_gain
-            self._field.hue = self.plaid_hue
+            self._field.gain = self._live["gain"].value
+            self._field.hue = self.live_hue
             self._field.disorder_pulses = self.mode == "caipira"
         elif self.mode == "mato":
             self._field.gain = self.meadow_gain
         elif self.mode == "paisagens":
-            self._field.gain = self.landscape_gain
+            self._field.gain = self._live["landscape_gain"].value
             index = self.landscape_index
-            if self._field.bristle_width != self.landscape_bristle_width:
-                self._field.set_bristles(self.landscape_bristle_width)
+            # Refazer as cerdas custa um blur do quadro: so a cada meio px de feixe.
+            bristle = self._live["bristle"].value
+            if abs(self._field.bristle_width - bristle) >= 0.5 or (
+                bristle == self.landscape_bristle_width
+                and self._field.bristle_width != bristle
+            ):
+                self._field.set_bristles(bristle)
             if self._field.index != index:
                 image = self._landscape_images[index][1]
                 self._field.set_image(image, index, self._crop_anchor(image))
@@ -5082,7 +5298,7 @@ class VisionProcessor:
         threshold = self.FLOW_THRESHOLD
         if self.mode == "xadrez":
             # Mais sensivel = movimento mais lento ja empurra as linhas.
-            threshold /= self.plaid_sensitivity
+            threshold /= self._live["sensitivity"].value
         self._field.update(flow, scale, threshold)
         if self.mode in (*PLAID_MODES, "paisagens"):
             now = self.clock()
@@ -5096,8 +5312,8 @@ class VisionProcessor:
                 if self._hand_tracker is not None:
                     self._touch_lines_with_hands(frame_bgr, now)
             else:
-                self._field.regen_delay = self.landscape_regen_delay
-                self._field.regen_time = self.landscape_regen_time
+                self._field.regen_delay = self._live["regen_delay"].value
+                self._field.regen_time = self._live["regen_time"].value
                 self._field.regenerate(dt)
         # O caipira conta as pessoas em todo quadro, com ou sem silhueta; a mesma
         # mascara serve a silhueta, para o MOG2 aprender uma vez so por quadro.
@@ -5115,7 +5331,7 @@ class VisionProcessor:
         # por cima.
         if self.mode in PLAID_MODES and self.silhouette:
             body = self._silhouette_fill(frame_bgr, body_mask, small)
-            if self.mode == "caipira" and self.camera_brightness > 0.0:
+            if self.mode == "caipira" and self._live["camera"].value > 0.0:
                 # A imagem da camera por baixo; a silhueta fica onde e mais clara.
                 body = cv2.max(self._camera_backdrop(frame_bgr), body)
         else:
@@ -5134,7 +5350,7 @@ class VisionProcessor:
             self._draw_people_debug(debug)
         if self._hand_tracker is not None and self.render.debug_output:
             # As maos so aparecem no debug, nunca na projecao.
-            radius = max(4, round(HAND_TOUCH_RADIUS * self.plaid_sensitivity * height))
+            radius = max(4, round(HAND_TOUCH_RADIUS * self._live["sensitivity"].value * height))
             for x, y in self._previous_hands.tolist():
                 cv2.circle(debug, (round(x), round(y)), radius, (0, 255, 255), 2, cv2.LINE_AA)
         return VisionResult(None, debug, body)
@@ -5151,7 +5367,7 @@ class VisionProcessor:
             self._previous_hands,
             hands,
             HAND_MAX_JUMP * height,
-            HAND_MIN_MOVE / self.plaid_sensitivity * height,
+            HAND_MIN_MOVE / self._live["sensitivity"].value * height,
         )
         self._previous_hands = hands
         # O YOLO nao da identidade as maos: uma mao que disparou ha menos de
@@ -5166,7 +5382,7 @@ class VisionProcessor:
             if all(np.hypot(*(path[1] - point)) > reach for point, _ in self._recent_fires)
         ]
         if paths:
-            radius = HAND_TOUCH_RADIUS * self.plaid_sensitivity * height
+            radius = HAND_TOUCH_RADIUS * self._live["sensitivity"].value * height
             for index in self._field.touch(paths, radius, now):
                 self._recent_fires.append((paths[index][1], now))
 
@@ -6969,7 +7185,7 @@ def main() -> int:
                             body,
                             processor.toada_players,
                             processor.toada_channels,
-                            processor.plaid_hue,
+                            processor.live_hue,
                             status,
                         ),
                     )
