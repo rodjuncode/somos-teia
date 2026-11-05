@@ -202,12 +202,8 @@ CAIPIRA_VOLUME_FLOOR = 0.02
 CAIPIRA_TRACK_MAX_JUMP = 0.2
 CAIPIRA_TRACK_GRACE = 1.0
 CAIPIRA_PLAYER_COLOR = (0, 255, 255)  # BGR: amarelo
-# Fundo do caipira: uma das pinturas de --image (padrao: a pasta paisagens/),
-# sorteada na partida e ajustada ao quadro como no modo paisagens, escurecida
-# para CAIPIRA_BACKGROUND_BRIGHTNESS: as linhas grossas sao compostas com max e
-# so aparecem onde sao mais claras que o fundo. A tecla i passa a proxima.
-CAIPIRA_BACKGROUND_BRIGHTNESS = 0.5
-CAIPIRA_IMAGE_KEY = ord("i")
+# Viola e jeca: a tecla i adianta a proxima pintura da sequencia.
+PAINTING_KEY = ord("i")
 # Modo viola: pinturas de --image em sequencia embaralhada, cada uma por
 # VIOLA_SLIDE_SECONDS, passando a seguinte num fade de VIOLA_FADE_SECONDS (tecla i
 # adianta). Cada pessoa detectada (ate 5; YOLO quando carregado, senao a mascara)
@@ -2889,7 +2885,7 @@ class VisionProcessor:
         self.landscape_index = 0
         # Pinturas ja ajustadas ao quadro para a janela da silhueta, por (indice, tamanho).
         self._window_cache: dict[tuple[int, int, int], np.ndarray] = {}
-        if mode in ("paisagens", "caipira", "viola", ROLE_MODE, JECA_MODE, JECATATU_MODE):
+        if mode in ("paisagens", "viola", ROLE_MODE, JECA_MODE, JECATATU_MODE):
             for path in list_landscape_images(landscape_image):
                 image = cv2.imread(path, cv2.IMREAD_COLOR)
                 if image is None:
@@ -2920,13 +2916,10 @@ class VisionProcessor:
             )
         self.plaid_rotation = plaid_rotation % 360.0
         self._rng = np.random.default_rng()
-        if mode in ("caipira", "viola", JECA_MODE):
+        if mode in ("viola", JECA_MODE):
             self.landscape_index = int(self._rng.integers(len(self._landscape_images)))
         if mode in ("viola", JECA_MODE):
             self._slide_next = self._next_slide_index()
-        # Fundo do caipira ja ajustado e escurecido, por (indice, largura, altura).
-        self._background_key: Optional[tuple[int, int, int]] = None
-        self._background: Optional[np.ndarray] = None
         # Sem --hue, o matiz base e laranja: DEFAULT_PLAID_HUE no xadrez, CAIPIRA_HUE
         # no caipira, viola e jecatatu.
         if plaid_hue is None:
@@ -3079,12 +3072,6 @@ class VisionProcessor:
                 + (" | silhueta" if self.silhouette else "")
                 + f" | {self.plaid_layout}"
                 + (" | pulsos das maos" if self._hand_tracker is not None else "")
-                + (
-                    f" | fundo {self._landscape_images[self.landscape_index][0]}"
-                    f" ({self.landscape_index + 1}/{len(self._landscape_images)})"
-                    if self.mode == "caipira"
-                    else ""
-                )
                 + (
                     f" | desordem {self.line_disorder:.0%}"
                     f" | pessoas {self._people_source} {self.people_count}"
@@ -4757,18 +4744,6 @@ class VisionProcessor:
             )
         return self._window_cache[key]
 
-    def _caipira_background(self, width: int, height: int) -> np.ndarray:
-        """Pintura atual ajustada ao quadro e escurecida; refeita so ao trocar."""
-        key = (self.landscape_index, width, height)
-        if self._background_key != key:
-            image = self._landscape_images[self.landscape_index][1]
-            fitted = fit_cover(image, width, height, self._crop_anchor(image))
-            self._background = cv2.convertScaleAbs(
-                fitted, alpha=CAIPIRA_BACKGROUND_BRIGHTNESS
-            )
-            self._background_key = key
-        return self._background
-
     def _crop_anchor(self, image: np.ndarray) -> float:
         """Altura do recorte: sorteada para imagens em retrato, --image-anchor nas outras."""
         height, width = image.shape[:2]
@@ -4863,14 +4838,10 @@ class VisionProcessor:
                 self._count_people_yolo(frame_bgr)
             boxes = self._people_yolo_boxes if self._yolo is not None else self._people_boxes
             self._play_toada(boxes, flow, scale, (width, height), self._field)
-        # A silhueta fica por baixo; linhas e pulsos sao desenhados por cima. No
-        # caipira, a pintura fica por baixo de tudo.
+        # A silhueta fica por baixo, sobre o preto; linhas e pulsos sao desenhados
+        # por cima.
         if self.mode in PLAID_MODES and self.silhouette:
             body = self._silhouette_fill(frame_bgr, body_mask, small)
-            if self.mode == "caipira":
-                body = cv2.max(self._caipira_background(width, height), body)
-        elif self.mode == "caipira":
-            body = self._caipira_background(width, height).copy()
         else:
             body = np.zeros_like(frame_bgr)
         self._field.draw(body)
@@ -5959,8 +5930,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=LANDSCAPE_DEFAULT_IMAGE,
         metavar="ARQUIVO_OU_PASTA",
         help="paisagens: imagem ou pasta de imagens que cobrem a tela; com uma pasta, "
-        "a/z alternam entre elas em ordem alfabetica; caipira: fundo das linhas, uma "
-        "sorteada na partida, tecla i passa a proxima (padrao: a pasta paisagens/)",
+        "a/z alternam entre elas em ordem alfabetica; viola, roda, jeca e jecatatu: "
+        "as pinturas da obra (padrao: a pasta paisagens/)",
     )
     parser.add_argument(
         "--image-anchor",
@@ -6170,7 +6141,7 @@ MODE_KEY_HELP = {
     "xadrez": "a/z densidade | s/x ganho | h/n sensibilidade | d/c rotacao | f/v matiz | g silhueta | "
     "l malha mix/regular | b fundo (Kinect)",
     "caipira": "a/z densidade | s/x ganho | d/c rotacao | f/v matiz | "
-    "l malha mix/regular | i proxima pintura | b fundo (Kinect)",
+    "l malha mix/regular | b fundo (Kinect)",
     ROLE_MODE: "e borda poligono/serrilhado/suave",
     JECA_MODE: "i proxima pintura | e borda poligono/serrilhado/suave",
     JECATATU_MODE: "e borda poligono/serrilhado/suave | a/z densidade | s/x ganho | "
@@ -6464,10 +6435,7 @@ def main() -> int:
                 elif key == ord("b"):
                     calibrate_kinect_background(capturer)
             elif active_mode in PLAID_MODES:
-                if active_mode == "caipira" and key == CAIPIRA_IMAGE_KEY:
-                    processor.switch_landscape(1)
-                    print(processor.label)
-                elif key in PLAID_KEY_ADJUSTMENTS:
+                if key in PLAID_KEY_ADJUSTMENTS:
                     processor.adjust_plaid(**PLAID_KEY_ADJUSTMENTS[key])
                     print(processor.label)
                 elif key == SILHOUETTE_TOGGLE_KEY:
@@ -6479,7 +6447,7 @@ def main() -> int:
                 elif key == ord("b") and isinstance(capturer, KinectV1Capturer):
                     # A silhueta usa a mascara de profundidade, que melhora com o fundo.
                     calibrate_kinect_background(capturer)
-            elif active_mode in ("viola", JECA_MODE) and key == CAIPIRA_IMAGE_KEY:
+            elif active_mode in ("viola", JECA_MODE) and key == PAINTING_KEY:
                 processor.skip_slide()
                 print(processor.label)
             elif active_mode in (ROLE_MODE, JECA_MODE, JECATATU_MODE) and key == ROLE_EDGE_KEY:
