@@ -2784,8 +2784,9 @@ class VisionProcessor:
         self._hand_sequence = 0
         self._previous_hands = np.empty((0, 2), dtype=np.float32)
         self._recent_fires: list[tuple[np.ndarray, float]] = []
-        # Alternada pela tecla g na thread principal; o worker so le o valor.
-        self.silhouette = silhouette
+        # Alternada pela tecla g na thread principal; o worker so le o valor. No
+        # caipira (a obra) fica sempre ligada.
+        self.silhouette = silhouette or mode == "caipira"
         # Criado na primeira vez que a silhueta precisa do MOG2 (sem Kinect).
         self._silhouette_mog2 = None
         # Pessoas detectadas no caipira; o worker escreve, a thread principal le.
@@ -3169,7 +3170,8 @@ class VisionProcessor:
         )
 
     def toggle_silhouette(self) -> None:
-        self.silhouette = not self.silhouette
+        if self.mode != "caipira":
+            self.silhouette = not self.silhouette
 
     def _max_plaid_density(self) -> float:
         high = PLAID_DENSITY_RANGE[1]
@@ -5917,7 +5919,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="silhueta dos corpos (mascara de profundidade no Kinect, MOG2 nas outras "
         "fontes; tecla g liga/desliga): no xadrez e preenchida pela cor base; no "
         "paisagens e uma janela para a proxima pintura da lista (padrao: ligada no "
-        "xadrez, desligada nos outros modos)",
+        "xadrez, desligada nos outros modos; no caipira, sempre ligada)",
     )
     parser.add_argument(
         "--layout",
@@ -6048,10 +6050,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         args.mode = DEFAULT_MODE
     if args.layout is None:
         args.layout = "regular" if args.mode in ("viola", JECATATU_MODE) else "mix"
-    if args.silhouette is None:
-        # A silhueta vem ligada so no xadrez; no paisagens ela abriria a janela
-        # para outra pintura, que fica como opcao.
-        args.silhouette = args.mode == "xadrez"
+    if args.mode == "caipira" and args.silhouette is False:
+        print("Aviso: no caipira a silhueta fica sempre ligada; ignorando --no-silhouette.",
+              file=sys.stderr)
+    if args.silhouette is None or args.mode == "caipira":
+        # A silhueta vem ligada no xadrez e sempre no caipira; no paisagens ela
+        # abriria a janela para outra pintura, que fica como opcao.
+        args.silhouette = args.mode in ("xadrez", "caipira")
     if args.mode == "kinect" and args.source != "kinect":
         parser.error("--mode kinect requer --source kinect")
     if args.max_distance <= 0:
@@ -6164,7 +6169,7 @@ MODE_KEY_HELP = {
     "kinect": "a/z profundidade minima | s/x maxima | b calibra o fundo (sala vazia)",
     "xadrez": "a/z densidade | s/x ganho | h/n sensibilidade | d/c rotacao | f/v matiz | g silhueta | "
     "l malha mix/regular | b fundo (Kinect)",
-    "caipira": "a/z densidade | s/x ganho | d/c rotacao | f/v matiz | g silhueta | "
+    "caipira": "a/z densidade | s/x ganho | d/c rotacao | f/v matiz | "
     "l malha mix/regular | i proxima pintura | b fundo (Kinect)",
     ROLE_MODE: "e borda poligono/serrilhado/suave",
     JECA_MODE: "i proxima pintura | e borda poligono/serrilhado/suave",
