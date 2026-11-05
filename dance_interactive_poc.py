@@ -17,7 +17,8 @@ Use --fallback-video para reserva quando Kinect e webcam falharem.
 Algoritmo: --mode kinect|mog2|optical_flow|conexoes|capim|mato|paisagens|xadrez|caipira|viola|
 roda-de-viola|jeca|
 jecatatu.
-Sem --mode, o modo e caipira em todas as fontes.
+Sem --mode, o modo e caipira em todas as fontes. O xadrez e laranja, com a silhueta dos
+corpos ligada e pulsos nascendo das maos.
 Faixa inicial: --min-depth/--max-depth (mm). Atalhos Kinect: a/z diminuem/aumentam
 Min Depth; s/x diminuem/aumentam Max Depth, em passos de 100 mm. Pressione b
 com a sala vazia para capturar o fundo e recortar apenas o que se move a frente.
@@ -419,6 +420,8 @@ MP3_DECODER_DELAY = 529
 DEFAULT_PLAID_DENSITY = 1.0
 DEFAULT_PLAID_GAIN = 1.0
 DEFAULT_PLAID_ROTATION = 0.0
+# Matiz inicial do xadrez: laranja (30 graus). None (so pela API) sorteia um.
+DEFAULT_PLAID_HUE = 30.0
 PLAID_HUE_STEP = 10.0
 # Teclas do modo xadrez, em pares diminui/aumenta como as do Kinect: densidade
 # muda por fator; ganho, rotacao e matiz (graus) por soma. Matiz crescente
@@ -435,6 +438,8 @@ PLAID_KEY_ADJUSTMENTS = {
     ord("c"): {"rotation_delta": PLAID_ROTATION_STEP},
     ord("f"): {"hue_delta": -PLAID_HUE_STEP},
     ord("v"): {"hue_delta": PLAID_HUE_STEP},
+    ord("h"): {"sensitivity_factor": 1.0 / 1.25},
+    ord("n"): {"sensitivity_factor": 1.25},
 }
 # Acima de ~4x o numero de linhas (e o custo do desenho) passa de ~4x o padrao.
 PLAID_DENSITY_RANGE = (0.25, 4.0)
@@ -442,6 +447,13 @@ PLAID_DENSITY_RANGE = (0.25, 4.0)
 # do desenho dispara (ela ja tem o dobro da densidade global).
 PLAID_MIX_MAX_DENSITY = 2.0
 PLAID_MAX_GAIN = 5.0
+# Sensibilidade da interacao dos corpos com as linhas (--sensitivity, teclas h/n):
+# quanto movimento basta, nao com que forca empurra (isso e o --gain). Divide o
+# movimento minimo que o fluxo precisa ter para empurrar as linhas e o que a mao
+# precisa andar para disparar pulsos, e multiplica o raio de toque da mao. O filtro
+# do movimento fantasma do Farneback nao muda.
+DEFAULT_PLAID_SENSITIVITY = 1.0
+PLAID_SENSITIVITY_RANGE = (0.25, 4.0)
 # Meio sett (a outra metade e o espelho, como nos tecidos Madras).
 PLAID_HALF_SETT = 0.45
 # Linhas por faixa e seus pesos; espacamento entre linhas da mesma faixa.
@@ -506,6 +518,27 @@ PULSE_GLOW_DOWNSCALE = 4
 PULSE_GLOW_THICKNESS = 2
 PULSE_GLOW_BLUR = 7
 PULSE_GLOW_GAIN = 2.0
+# Pulsos das maos (padrao da CLI): em vez de sorteados, os pulsos nascem onde uma
+# mao passa por uma linha. O YOLO-pose acha os pulsos (punhos) de cada pessoa numa
+# thread propria; a mao fica HAND_REACH do antebraco alem do punho (direcao
+# cotovelo -> punho). Quando a mao, em movimento, passa a ate HAND_TOUCH_RADIUS
+# (fracao da altura do quadro) de uma linha, nasce ali um pulso para cada lado.
+# Para so gestos dispararem e a tela nao inundar (sete pessoas mexendo os bracos
+# davam ~240 pulsos/s sem isso): cada mao dispara uma linha por vez e espera
+# HAND_COOLDOWN s; cada linha espera HAND_LINE_COOLDOWN s; e no total nascem no
+# maximo HAND_LINES_PER_SECOND linhas disparadas por segundo.
+PULSE_SOURCES = ("hands", "random")
+HAND_REACH = 0.35
+HAND_TOUCH_RADIUS = 0.025
+# Entre duas deteccoes, a mesma mao anda ate HAND_MAX_JUMP e precisa andar ao menos
+# HAND_MIN_MOVE (fracoes da altura) para contar como gesto: o punho do YOLO treme
+# ~0,5-1% da altura mesmo parado.
+HAND_MAX_JUMP = 0.2
+HAND_MIN_MOVE = 0.02
+HAND_COOLDOWN = 0.25
+HAND_LINE_COOLDOWN = 1.0
+HAND_LINES_PER_SECOND = 12.0
+COCO_ELBOWS_WRISTS = ((7, 9), (8, 10))
 # Coordenadas subpixel no cv2.polylines (2 bits = 1/4 px): o pulso desliza suave.
 PULSE_SUBPIXEL_SHIFT = 2
 # Cada linha e uma cadeia de nos a cada PLAID_NODE_SPACING px, desenhada como
@@ -1103,6 +1136,114 @@ class VisionResult:
     body_frame: np.ndarray
 
 
+def yolo_keypoints(backend, frame_bgr: np.ndarray) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    """Keypoints COCO (pessoas, 17, 2) em coordenadas do quadro, e confiancas."""
+    height, width = frame_bgr.shape[:2]
+    input_height, input_width = YOLO_INPUT_SIZE
+    frame_small = frame_bgr
+    if width > 2 * input_width and height > 2 * input_height:
+        # Reduzir ate 2x com LINEAR e terminar com AREA da quase o mesmo resultado
+        # que AREA direto (diferenca media de 0,2 nivel) em ~40% do tempo, em 720p.
+        frame_small = cv2.resize(
+            frame_small,
+            (2 * input_width, 2 * input_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    frame_small = cv2.resize(
+        frame_small, (input_width, input_height), interpolation=cv2.INTER_AREA
+    )
+    points, confidence = backend.keypoints(frame_small)
+    points = np.asarray(points, dtype=np.float32) * np.array(
+        (width / input_width, height / input_height), dtype=np.float32
+    )
+    return points, confidence
+
+
+def hand_positions(points: np.ndarray, confidence: Optional[np.ndarray]) -> np.ndarray:
+    """Maos (N, 2): um pouco alem de cada punho visivel, na direcao do antebraco."""
+    hands = []
+    for person in range(len(points)):
+        for elbow, wrist in COCO_ELBOWS_WRISTS:
+            seen = confidence is None or confidence[person, wrist] >= YOLO_MIN_KEYPOINT_CONFIDENCE
+            if not seen:
+                continue
+            hand = points[person, wrist].astype(np.float32)
+            if confidence is None or confidence[person, elbow] >= YOLO_MIN_KEYPOINT_CONFIDENCE:
+                hand = hand + HAND_REACH * (points[person, wrist] - points[person, elbow])
+            hands.append(hand)
+    return np.asarray(hands, dtype=np.float32).reshape(-1, 2)
+
+
+def hand_paths(
+    previous: np.ndarray, current: np.ndarray, max_jump: float, min_move: float
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Caminho (antes, agora) de cada mao que andou entre duas deteccoes.
+
+    A ordem das pessoas do YOLO muda de um quadro para outro: cada mao atual e
+    casada com a anterior mais proxima, a ate max_jump. Maos novas, que sumiram ou
+    que andaram menos de min_move nao geram caminho.
+    """
+    if len(previous) == 0 or len(current) == 0:
+        return []
+    distance = np.hypot(*(current[:, None] - previous[None]).transpose(2, 0, 1))
+    paths = []
+    for index, nearest in enumerate(distance.argmin(axis=1)):
+        if min_move <= distance[index, nearest] <= max_jump:
+            paths.append((previous[nearest], current[index]))
+    return paths
+
+
+class HandTracker:
+    """Roda o YOLO-pose numa thread propria e publica as maos mais recentes.
+
+    O xadrez entrega cada quadro e segue sem esperar: o YOLO sempre pega o quadro
+    mais novo, e o desenho usa a ultima deteccao pronta. Assim os ~15-20 ms de
+    inferencia em CPU nao entram no tempo de cada quadro do xadrez.
+    """
+
+    def __init__(self, backend) -> None:
+        self._backend = backend
+        self._lock = threading.Lock()
+        self._frame: Optional[np.ndarray] = None
+        self._new_frame = threading.Event()
+        self._stop = threading.Event()
+        self.hands = np.empty((0, 2), dtype=np.float32)
+        self.sequence = 0
+        self.error: Optional[Exception] = None
+        self._thread = threading.Thread(target=self._loop, name="hand-tracker", daemon=True)
+        self._thread.start()
+
+    def submit(self, frame_bgr: np.ndarray) -> None:
+        with self._lock:
+            self._frame = frame_bgr
+        self._new_frame.set()
+
+    def latest(self) -> tuple[int, np.ndarray]:
+        with self._lock:
+            return self.sequence, self.hands
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            if not self._new_frame.wait(timeout=0.1):
+                continue
+            self._new_frame.clear()
+            with self._lock:
+                frame = self._frame
+            try:
+                hands = hand_positions(*yolo_keypoints(self._backend, frame))
+            except Exception as exc:
+                self.error = exc
+                print(f"Aviso: deteccao das maos parou ({exc}).", file=sys.stderr)
+                return
+            with self._lock:
+                self.hands = hands
+                self.sequence += 1
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+
 class PresentationDeadband:
     def __init__(self, threshold_px: float = 4.0) -> None:
         if threshold_px < 0:
@@ -1524,6 +1665,33 @@ class NeonPulses:
         self._speed = np.empty(0, dtype=np.float32)
         self._tail = np.empty(0, dtype=np.float32)
         self._reverse = np.empty(0, dtype=bool)
+        # Quanto cada pulso ja andou: a cauda cresce a partir do ponto onde nasceu.
+        self._traveled = np.empty(0, dtype=np.float32)
+
+    def _append(self, family, line, position, speed, tail, reverse) -> None:
+        self._family = np.concatenate((self._family, family))
+        self._line = np.concatenate((self._line, line))
+        self._position = np.concatenate((self._position, np.asarray(position, np.float32)))
+        self._speed = np.concatenate((self._speed, np.asarray(speed, np.float32)))
+        self._tail = np.concatenate((self._tail, np.asarray(tail, np.float32)))
+        self._reverse = np.concatenate((self._reverse, reverse))
+        self._traveled = np.concatenate((self._traveled, np.zeros(len(family), np.float32)))
+
+    def spawn_at(self, family: int, line: int, sample: float) -> None:
+        """Dois pulsos nascendo na amostra sample da linha, um para cada lado."""
+        room = min(2, self._render.pulse_max - len(self))
+        if room <= 0:
+            return
+        samples = float(self._sample_counts[family])
+        speed = samples / self._rng.uniform(*PULSE_CROSSING_SECONDS)
+        tail = float(np.clip(speed * PULSE_TAIL_SECONDS, *PULSE_TAIL_SAMPLES))
+        reverse = np.array((False, True)[:room])
+        # Posicao conta da ponta de onde o pulso vem: o de volta comeca em last - sample.
+        position = np.where(reverse, samples - 1.0 - sample, sample)
+        self._append(
+            np.full(room, family, np.intp), np.full(room, line, np.intp), position,
+            np.full(room, speed), np.full(room, tail), reverse,
+        )
 
     def _spawn(self, count: int) -> None:
         total = int(self._line_counts.sum())
@@ -1537,18 +1705,19 @@ class NeonPulses:
         samples = self._sample_counts[family]
         speed = samples / self._rng.uniform(*PULSE_CROSSING_SECONDS, count)
         tail = np.clip(speed * PULSE_TAIL_SECONDS, *PULSE_TAIL_SAMPLES)
-        self._family = np.concatenate((self._family, family))
-        self._line = np.concatenate((self._line, line))
-        self._position = np.concatenate((self._position, np.zeros(count, np.float32)))
-        self._speed = np.concatenate((self._speed, speed.astype(np.float32)))
-        self._tail = np.concatenate((self._tail, tail.astype(np.float32)))
-        self._reverse = np.concatenate((self._reverse, self._rng.random(count) < 0.5))
+        self._append(
+            family, line, np.zeros(count), speed, tail, self._rng.random(count) < 0.5
+        )
 
     def advance(self, dt: float) -> None:
         """Move os pulsos dt segundos, descarta os que sairam e sorteia novos."""
-        self._position += self._speed * (self.speed_scale * dt)
+        step = self._speed * (self.speed_scale * dt)
+        self._position += step
+        self._traveled += step
         alive = self._position - self._tail < self._sample_counts[self._family] - 1
-        for name in ("_family", "_line", "_position", "_speed", "_tail", "_reverse"):
+        for name in (
+            "_family", "_line", "_position", "_speed", "_tail", "_reverse", "_traveled"
+        ):
             setattr(self, name, getattr(self, name)[alive])
         if self.rate > 0 and dt > 0:
             self._spawn(int(self._rng.poisson(self.rate * dt)))
@@ -1565,7 +1734,8 @@ class NeonPulses:
         # pulsos de uma vez; posicoes fora da linha colapsam nas pontas.
         last = self._sample_counts[self._family] - 1.0
         head = np.where(self._reverse, last - self._position, self._position)
-        back = head + np.where(self._reverse, self._tail, -self._tail)
+        tail = np.minimum(self._tail, self._traveled)
+        back = head + np.where(self._reverse, tail, -tail)
         fractions = np.linspace(0.0, 1.0, PULSE_FADE_STEPS * PULSE_STEP_POINTS + 1)
         positions = np.clip(
             back[:, None] + (head - back)[:, None] * fractions, 0.0, last[:, None]
@@ -1790,9 +1960,71 @@ class PlaidStack:
         for (field, _), share in zip(self._layers, self._pulse_shares):
             field.pulses.rate = share
         self._scratch = np.zeros((height, width, 3), dtype=np.uint8)
+        # Curvas do ultimo desenho, por camada e familia, para achar as linhas que
+        # as maos tocam; e o instante do ultimo disparo de cada linha.
+        self._last_curves: list[list[Optional[np.ndarray]]] = []
+        self._touch_times: dict[tuple[int, int, int], float] = {}
+        self._bucket = HAND_LINES_PER_SECOND
+        self._bucket_time = 0.0
 
     def __len__(self) -> int:
         return sum(len(field) for field, _ in self._layers)
+
+    def touch(
+        self, segments: list[tuple[np.ndarray, np.ndarray]], radius: float, now: float
+    ) -> list[int]:
+        """Dispara pulsos na linha mais proxima do caminho de cada mao, a ate radius.
+
+        Cada segmento e o caminho de uma mao entre duas deteccoes; os pulsos nascem
+        no ponto da linha mais proximo dele. Devolve os indices dos segmentos que
+        dispararam.
+        """
+        fired = []
+        # Balde de fichas: enche HAND_LINES_PER_SECOND por segundo, ate um segundo de folga.
+        elapsed = now - self._bucket_time
+        self._bucket_time = now
+        self._bucket = min(HAND_LINES_PER_SECOND, self._bucket + elapsed * HAND_LINES_PER_SECOND)
+        for segment_index, (start, end) in enumerate(segments):
+            if self._bucket < 1.0:
+                break
+            low = np.minimum(start, end) - radius
+            high = np.maximum(start, end) + radius
+            step = end - start
+            length2 = max(float(step @ step), 1e-6)
+            candidates = []
+            for layer, family_curves in enumerate(self._last_curves):
+                for family, curves in enumerate(family_curves):
+                    if curves is None:
+                        continue
+                    inside = np.all((curves >= low) & (curves <= high), axis=2)
+                    if not inside.any():
+                        continue
+                    lines, samples = np.nonzero(inside)
+                    points = curves[lines, samples]
+                    along = np.clip(((points - start) @ step) / length2, 0.0, 1.0)
+                    nearest = start + along[:, None] * step
+                    distance = np.hypot(*(points - nearest).T)
+                    near = distance <= radius
+                    if not near.any():
+                        continue
+                    lines, samples, distance = lines[near], samples[near], distance[near]
+                    # A amostra mais proxima de cada linha tocada.
+                    order = np.lexsort((distance, lines))
+                    _, first = np.unique(lines[order], return_index=True)
+                    for index in order[first]:
+                        candidates.append(
+                            (float(distance[index]), layer, family, int(lines[index]), float(samples[index]))
+                        )
+            for _, layer, family, line, sample in sorted(candidates):
+                key = (layer, family, line)
+                if now - self._touch_times.get(key, -math.inf) < HAND_LINE_COOLDOWN:
+                    continue
+                self._touch_times[key] = now
+                self._layers[layer][0].pulses.spawn_at(family, line, sample)
+                self._bucket -= 1.0
+                fired.append(segment_index)
+                break
+        return fired
 
     @property
     def pulse_count(self) -> int:
@@ -1814,6 +2046,7 @@ class PlaidStack:
     def reset(self) -> None:
         for field, _ in self._layers:
             field.reset()
+        self._touch_times.clear()
 
     def update(
         self, flow: Optional[np.ndarray], scale: np.ndarray, threshold: float
@@ -1848,6 +2081,7 @@ class PlaidStack:
 
     def draw(self, image: np.ndarray) -> None:
         drawn = [field.line_batches(self.hue) for field, _ in self._layers]
+        self._last_curves = [family_curves for family_curves, _ in drawn]
         if not self._render.antialias:
             # Sem anti-aliasing, linha grossa direto no quadro ja e barata; da camada
             # mais distante a mais proxima, as finas por cima das grossas.
@@ -2045,10 +2279,18 @@ class LandscapeCanvas:
     """
 
     def __init__(
-        self, width: int, height: int, image: np.ndarray, anchor: float, index: int = 0
+        self,
+        width: int,
+        height: int,
+        image: np.ndarray,
+        anchor: float,
+        index: int = 0,
+        rng: Optional[np.random.Generator] = None,
     ) -> None:
         self.size = (width, height)
         self.gain = 1.0
+        # Sorteia as cerdas; o do processador, para uma semente fixa valer para tudo.
+        self._rng = rng if rng is not None else np.random.default_rng()
         self.regen_delay = LANDSCAPE_REGEN_DELAY
         self.regen_time = LANDSCAPE_REGEN_TIME
         # Segundos sem movimento por celula do fluxo; criado com o primeiro fluxo.
@@ -2069,7 +2311,7 @@ class LandscapeCanvas:
         """Refaz as cerdas com feixes de bristle_width px; o borrao ja feito fica."""
         width, height = self.size
         self.bristle_width = bristle_width
-        noise = np.random.default_rng().standard_normal((height, width)).astype(np.float32)
+        noise = self._rng.standard_normal((height, width)).astype(np.float32)
         noise = cv2.GaussianBlur(noise, (0, 0), bristle_width / 2.0)
         noise /= max(float(noise.std()), 1e-6)
         self._bristles = np.clip(1.0 + LANDSCAPE_BRISTLE * noise, 0.0, 2.0)
@@ -2497,9 +2739,11 @@ class VisionProcessor:
         landscape_palette: str = "original",
         plaid_density: float = DEFAULT_PLAID_DENSITY,
         plaid_gain: float = DEFAULT_PLAID_GAIN,
+        plaid_sensitivity: float = DEFAULT_PLAID_SENSITIVITY,
         plaid_rotation: Optional[float] = None,
         plaid_hue: Optional[float] = None,
         pulse_rate: float = DEFAULT_PULSE_RATE,
+        pulse_source: str = "random",
         silhouette: bool = False,
         plaid_layout: str = "mix",
         render: PlaidRender = PlaidRender(),
@@ -2532,6 +2776,14 @@ class VisionProcessor:
         self.plaid_layout = plaid_layout
         self.render = render
         self.pulse_rate = pulse_rate
+        if pulse_source not in PULSE_SOURCES:
+            raise ValueError(f"Origem de pulsos desconhecida: {pulse_source}")
+        self.pulse_source = pulse_source
+        # Maos detectadas pelo YOLO (so no xadrez com pulsos das maos).
+        self._hand_tracker: Optional[HandTracker] = None
+        self._hand_sequence = 0
+        self._previous_hands = np.empty((0, 2), dtype=np.float32)
+        self._recent_fires: list[tuple[np.ndarray, float]] = []
         # Alternada pela tecla g na thread principal; o worker so le o valor.
         self.silhouette = silhouette
         # Criado na primeira vez que a silhueta precisa do MOG2 (sem Kinect).
@@ -2653,6 +2905,10 @@ class VisionProcessor:
                 file=sys.stderr,
             )
         self.plaid_gain = plaid_gain
+        low, high = PLAID_SENSITIVITY_RANGE
+        if not low <= plaid_sensitivity <= high:
+            raise ValueError(f"plaid_sensitivity deve estar entre {low} e {high}")
+        self.plaid_sensitivity = plaid_sensitivity
         if plaid_rotation is None:
             plaid_rotation = (
                 JECATATU_ROTATION
@@ -2670,12 +2926,11 @@ class VisionProcessor:
         # Fundo do caipira ja ajustado e escurecido, por (indice, largura, altura).
         self._background_key: Optional[tuple[int, int, int]] = None
         self._background: Optional[np.ndarray] = None
-        # Sem --hue, o matiz base e sorteado no xadrez e laranja no caipira.
+        # Sem --hue, o matiz base e laranja: DEFAULT_PLAID_HUE no xadrez, CAIPIRA_HUE
+        # no caipira, viola e jecatatu.
         if plaid_hue is None:
             plaid_hue = (
-                CAIPIRA_HUE
-                if mode in ("caipira", "viola", JECATATU_MODE)
-                else float(self._rng.uniform(0.0, 360.0))
+                CAIPIRA_HUE if mode in ("caipira", "viola", JECATATU_MODE) else DEFAULT_PLAID_HUE
             )
         self.plaid_hue = plaid_hue % 360.0
         # Os padroes do xadrez (sett, fase de cada direcao e desvio de angulo, um
@@ -2734,6 +2989,29 @@ class VisionProcessor:
                     f"Aviso: contagem de pessoas pelo YOLO desativada no {mode}: {exc}",
                     file=sys.stderr,
                 )
+        elif mode == "xadrez" and pulse_source == "hands":
+            self._start_hand_tracker(nogpu, int8)
+
+    def _start_hand_tracker(self, nogpu: bool, int8: Optional[bool]) -> None:
+        """Carrega o YOLO-pose para achar as maos; sem ele, volta aos pulsos sorteados."""
+        try:
+            self._load_yolo(nogpu, int8)
+        except Exception as exc:
+            print(
+                f"Aviso: sem YOLO para achar as maos ({exc}); os pulsos voltam a nascer "
+                "sorteados. Para os pulsos das maos, instale requirements.txt.",
+                file=sys.stderr,
+            )
+            self.pulse_source = "random"
+            return
+        # A inferencia roda na thread do HandTracker, nao na do processamento.
+        self.cpu_inference = False
+        self._hand_tracker = HandTracker(self._yolo)
+        print(f"Pulsos das maos: YOLO-pose em {self._yolo_backend}.")
+
+    def close(self) -> None:
+        if self._hand_tracker is not None:
+            self._hand_tracker.close()
 
     @property
     def label(self) -> str:
@@ -2796,8 +3074,10 @@ class VisionProcessor:
                 f"{self.mode.capitalize()}: dens. {self.plaid_density:.2f} | "
                 f"ganho {self.plaid_gain:.1f} | "
                 f"rot. {self.plaid_rotation:.0f} | matiz {self.plaid_hue:.0f}"
+                + (f" | sens. {self.plaid_sensitivity:.2f}" if self.mode == "xadrez" else "")
                 + (" | silhueta" if self.silhouette else "")
                 + f" | {self.plaid_layout}"
+                + (" | pulsos das maos" if self._hand_tracker is not None else "")
                 + (
                     f" | fundo {self._landscape_images[self.landscape_index][0]}"
                     f" ({self.landscape_index + 1}/{len(self._landscape_images)})"
@@ -2909,6 +3189,7 @@ class VisionProcessor:
         gain_delta: float = 0.0,
         rotation_delta: float = 0.0,
         hue_delta: float = 0.0,
+        sensitivity_factor: float = 1.0,
     ) -> None:
         """Ajusta o xadrez pelo teclado; o worker aplica no proximo frame."""
         low = PLAID_DENSITY_RANGE[0]
@@ -2920,6 +3201,10 @@ class VisionProcessor:
         )
         self.plaid_rotation = (self.plaid_rotation + rotation_delta) % 360.0
         self.plaid_hue = (self.plaid_hue + hue_delta) % 360.0
+        low, high = PLAID_SENSITIVITY_RANGE
+        self.plaid_sensitivity = round(
+            min(high, max(low, self.plaid_sensitivity * sensitivity_factor)), 6
+        )
 
     def _load_yolo(self, nogpu: bool, int8: Optional[bool] = None) -> None:
         try:
@@ -3119,7 +3404,9 @@ class VisionProcessor:
             index = self.landscape_index
             image = self._landscape_images[index][1]
             self._window_cache.clear()
-            return LandscapeCanvas(width, height, image, self._crop_anchor(image), index)
+            return LandscapeCanvas(
+                width, height, image, self._crop_anchor(image), index, self._rng
+            )
         if self.mode == "mato":
             return MeadowField(width, height, self.meadow_density, self._rng)
         if self.mode in (*PLAID_MODES, "viola", JECATATU_MODE):
@@ -3130,8 +3417,11 @@ class VisionProcessor:
                 self.plaid_layout,
                 self.plaid_density,
                 self.plaid_rotation,
-                # No jecatatu os pulsos so saem dos contatos.
-                0.0 if self.mode == JECATATU_MODE else self.pulse_rate,
+                # No jecatatu os pulsos so saem dos contatos; com as maos (xadrez),
+                # so dos toques: nenhum nasce sorteado.
+                0.0
+                if self.mode == JECATATU_MODE or self._hand_tracker is not None
+                else self.pulse_rate,
                 self._rng,
                 self.render,
             )
@@ -4540,7 +4830,11 @@ class VisionProcessor:
         scale = np.array(
             (gray.shape[1] / width, gray.shape[0] / height), dtype=np.float32
         )
-        self._field.update(flow, scale, self.FLOW_THRESHOLD)
+        threshold = self.FLOW_THRESHOLD
+        if self.mode == "xadrez":
+            # Mais sensivel = movimento mais lento ja empurra as linhas.
+            threshold /= self.plaid_sensitivity
+        self._field.update(flow, scale, threshold)
         if self.mode in (*PLAID_MODES, "paisagens"):
             now = self.clock()
             # Limita o passo: uma pausa longa nao deve teletransportar os pulsos nem
@@ -4550,6 +4844,8 @@ class VisionProcessor:
             if self.mode in PLAID_MODES:
                 self._field.advance(dt)
                 self.line_disorder = self._field.disorder
+                if self._hand_tracker is not None:
+                    self._touch_lines_with_hands(frame_bgr, now)
             else:
                 self._field.regen_delay = self.landscape_regen_delay
                 self._field.regen_time = self.landscape_regen_time
@@ -4587,7 +4883,43 @@ class VisionProcessor:
         debug = cv2.max(frame_bgr, body) if self.render.debug_output else body
         if self.mode == "caipira" and self.render.debug_output:
             self._draw_people_debug(debug)
+        if self._hand_tracker is not None and self.render.debug_output:
+            # As maos so aparecem no debug, nunca na projecao.
+            radius = max(4, round(HAND_TOUCH_RADIUS * self.plaid_sensitivity * height))
+            for x, y in self._previous_hands.tolist():
+                cv2.circle(debug, (round(x), round(y)), radius, (0, 255, 255), 2, cv2.LINE_AA)
         return VisionResult(None, debug, body)
+
+    def _touch_lines_with_hands(self, frame_bgr: np.ndarray, now: float) -> None:
+        """Entrega o quadro ao YOLO e dispara pulsos com a deteccao mais recente."""
+        self._hand_tracker.submit(frame_bgr)
+        sequence, hands = self._hand_tracker.latest()
+        if sequence == self._hand_sequence:
+            return
+        self._hand_sequence = sequence
+        height = frame_bgr.shape[0]
+        paths = hand_paths(
+            self._previous_hands,
+            hands,
+            HAND_MAX_JUMP * height,
+            HAND_MIN_MOVE / self.plaid_sensitivity * height,
+        )
+        self._previous_hands = hands
+        # O YOLO nao da identidade as maos: uma mao que disparou ha menos de
+        # HAND_COOLDOWN s e reconhecida pela posicao (perto de onde disparou).
+        self._recent_fires = [
+            (point, moment) for point, moment in self._recent_fires if now - moment < HAND_COOLDOWN
+        ]
+        reach = HAND_MAX_JUMP * height
+        paths = [
+            path
+            for path in paths
+            if all(np.hypot(*(path[1] - point)) > reach for point, _ in self._recent_fires)
+        ]
+        if paths:
+            radius = HAND_TOUCH_RADIUS * self.plaid_sensitivity * height
+            for index in self._field.touch(paths, radius, now):
+                self._recent_fires.append((paths[index][1], now))
 
     def _process_flow(self, frame_bgr: np.ndarray, gray: np.ndarray) -> VisionResult:
         height, width = frame_bgr.shape[:2]
@@ -4759,25 +5091,7 @@ class VisionProcessor:
         self, frame_bgr: np.ndarray
     ) -> tuple[np.ndarray, Optional[np.ndarray]]:
         """Keypoints (pessoas, 17, 2) no quadro original e confiancas (pessoas, 17)."""
-        height, width = frame_bgr.shape[:2]
-        input_height, input_width = YOLO_INPUT_SIZE
-        frame_small = frame_bgr
-        if width > 2 * input_width and height > 2 * input_height:
-            # Reduzir ate 2x com LINEAR e terminar com AREA da quase o mesmo resultado
-            # que AREA direto (diferenca media de 0,2 nivel) em ~40% do tempo, em 720p.
-            frame_small = cv2.resize(
-                frame_small,
-                (2 * input_width, 2 * input_height),
-                interpolation=cv2.INTER_LINEAR,
-            )
-        frame_small = cv2.resize(
-            frame_small, (input_width, input_height), interpolation=cv2.INTER_AREA
-        )
-        points, confidence = self._yolo.keypoints(frame_small)
-        points = np.asarray(points, dtype=np.float32) * np.array(
-            (width / input_width, height / input_height), dtype=np.float32
-        )
-        return points, confidence
+        return yolo_keypoints(self._yolo, frame_bgr)
 
     def _process_yolo(self, frame_bgr: np.ndarray) -> VisionResult:
         height, width = frame_bgr.shape[:2]
@@ -5471,7 +5785,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="algoritmo 2D: kinect, mog2, optical_flow, conexoes (malha YOLO), capim "
         "(capim movido pelo optical flow), mato (tracos em camadas, o do meio movido pelo "
         "optical flow), paisagens (imagem borrada pelo optical flow), xadrez (xadrez "
-        "Madras movido pelo optical flow), caipira (xadrez com pinturas e viola), viola "
+        "Madras movido pelo optical flow, com pulsos das maos), caipira (xadrez com "
+        "pinturas e a toada), viola "
         "(pinturas em sequencia e arpejos ligados pelas pessoas), roda-de-viola "
         "(silhuetas recortadas em paisagens sobre branco, com arpejos), jeca "
         "(pinturas em sequencia com as silhuetas em xadrez transparente) ou jecatatu "
@@ -5556,6 +5871,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "(padrao: %(default)s; teclas s/x no xadrez e no paisagens)",
     )
     parser.add_argument(
+        "--sensitivity",
+        type=float,
+        default=DEFAULT_PLAID_SENSITIVITY,
+        help="xadrez: sensibilidade da interacao dos corpos com as linhas: maior = "
+        "movimentos menores e mais lentos ja empurram as linhas e as maos disparam "
+        "pulsos de mais longe; nao muda a forca do empurrao (--gain) "
+        "(padrao: %(default)s, de 0.25 a 4; teclas h/n)",
+    )
+    parser.add_argument(
         "--rotation",
         type=float,
         default=None,
@@ -5568,23 +5892,32 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help="xadrez: matiz base das linhas em graus (0 vermelho, 120 verde, 240 azul); "
         "as faixas variam so em luminosidade, da cor pura ao branco "
-        f"(padrao: sorteado; {CAIPIRA_HUE:g}, laranja, no caipira; teclas f/v giram o "
-        "disco de cores)",
+        f"(padrao: {DEFAULT_PLAID_HUE:g}, laranja, no xadrez; {CAIPIRA_HUE:g} no caipira; "
+        "teclas f/v giram o disco de cores)",
     )
     parser.add_argument(
         "--pulses",
         type=float,
         default=DEFAULT_PULSE_RATE,
-        help="xadrez: pulsos de neon que nascem por segundo, em media, em intervalos "
-        "aleatorios; 0 desliga (padrao: %(default)s)",
+        help="xadrez com --pulse-source random: pulsos de neon que nascem por segundo, "
+        "em media, em intervalos aleatorios; 0 desliga (padrao: %(default)s)",
+    )
+    parser.add_argument(
+        "--pulse-source",
+        choices=PULSE_SOURCES,
+        default="hands",
+        help="xadrez: de onde nascem os pulsos: hands (onde as maos tocam as linhas, "
+        "achadas pelo YOLO-pose; sem ele, cai para random) ou random (sorteados) "
+        "(padrao: %(default)s)",
     )
     parser.add_argument(
         "--silhouette",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help="silhueta dos corpos (mascara de profundidade no Kinect, MOG2 nas outras "
         "fontes; tecla g liga/desliga): no xadrez e preenchida pela cor base; no "
-        "paisagens e uma janela para a proxima pintura da lista",
+        "paisagens e uma janela para a proxima pintura da lista (padrao: ligada no "
+        "xadrez, desligada nos outros modos)",
     )
     parser.add_argument(
         "--layout",
@@ -5715,6 +6048,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         args.mode = DEFAULT_MODE
     if args.layout is None:
         args.layout = "regular" if args.mode in ("viola", JECATATU_MODE) else "mix"
+    if args.silhouette is None:
+        # A silhueta vem ligada so no xadrez; no paisagens ela abriria a janela
+        # para outra pintura, que fica como opcao.
+        args.silhouette = args.mode == "xadrez"
     if args.mode == "kinect" and args.source != "kinect":
         parser.error("--mode kinect requer --source kinect")
     if args.max_distance <= 0:
@@ -5733,6 +6070,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         parser.error("--density deve ser maior que zero")
     if args.gain < 0:
         parser.error("--gain deve ser >= 0")
+    if not PLAID_SENSITIVITY_RANGE[0] <= args.sensitivity <= PLAID_SENSITIVITY_RANGE[1]:
+        parser.error("--sensitivity deve estar entre %g e %g" % PLAID_SENSITIVITY_RANGE)
     if args.pulses < 0:
         parser.error("--pulses deve ser >= 0")
     return args
@@ -5767,9 +6106,11 @@ def make_vision_processor(
     landscape_palette: str = "original",
     plaid_density: float = DEFAULT_PLAID_DENSITY,
     plaid_gain: float = DEFAULT_PLAID_GAIN,
+    plaid_sensitivity: float = DEFAULT_PLAID_SENSITIVITY,
     plaid_rotation: Optional[float] = None,
     plaid_hue: Optional[float] = None,
     pulse_rate: float = DEFAULT_PULSE_RATE,
+    pulse_source: str = "random",
     silhouette: bool = False,
     plaid_layout: str = "mix",
     render: PlaidRender = PlaidRender(),
@@ -5802,9 +6143,11 @@ def make_vision_processor(
             landscape_palette=landscape_palette,
             plaid_density=plaid_density,
             plaid_gain=plaid_gain,
+            plaid_sensitivity=plaid_sensitivity,
             plaid_rotation=plaid_rotation,
             plaid_hue=plaid_hue,
             pulse_rate=pulse_rate,
+            pulse_source=pulse_source,
             silhouette=silhouette,
             plaid_layout=plaid_layout,
             render=render,
@@ -5819,7 +6162,7 @@ def make_vision_processor(
 COMMON_KEY_HELP = "q sai | m troca a fonte | t metronomo, - / = andamento"
 MODE_KEY_HELP = {
     "kinect": "a/z profundidade minima | s/x maxima | b calibra o fundo (sala vazia)",
-    "xadrez": "a/z densidade | s/x ganho | d/c rotacao | f/v matiz | g silhueta | "
+    "xadrez": "a/z densidade | s/x ganho | h/n sensibilidade | d/c rotacao | f/v matiz | g silhueta | "
     "l malha mix/regular | b fundo (Kinect)",
     "caipira": "a/z densidade | s/x ganho | d/c rotacao | f/v matiz | g silhueta | "
     "l malha mix/regular | i proxima pintura | b fundo (Kinect)",
@@ -5894,9 +6237,11 @@ def main() -> int:
             landscape_palette=args.palette,
             plaid_density=args.density,
             plaid_gain=args.gain,
+            plaid_sensitivity=args.sensitivity,
             plaid_rotation=args.rotation,
             plaid_hue=args.hue,
             pulse_rate=args.pulses,
+            pulse_source=args.pulse_source,
             silhouette=args.silhouette,
             plaid_layout=args.layout,
             render=render,
@@ -6057,6 +6402,8 @@ def main() -> int:
                     active_mode = resolve_active_mode(args.mode, capturer)
                     if active_mode != previous_mode:
                         print_key_help(active_mode)
+                        if processor is not None:
+                            processor.close()
                         processor = make_vision_processor(
                             active_mode,
                             nogpu=args.nogpu,
@@ -6079,9 +6426,11 @@ def main() -> int:
                             landscape_palette=args.palette,
                             plaid_density=args.density,
                             plaid_gain=args.gain,
+                            plaid_sensitivity=args.sensitivity,
                             plaid_rotation=args.rotation,
                             plaid_hue=args.hue,
                             pulse_rate=args.pulses,
+                            pulse_source=args.pulse_source,
                             silhouette=args.silhouette,
                             plaid_layout=args.layout,
                             render=render,
@@ -6172,6 +6521,8 @@ def main() -> int:
         metronome.close()
         if arpeggios is not None:
             arpeggios.close()
+        if processor is not None:
+            processor.close()
         if worker is not None:
             worker.close()
         if capturer is not None:
